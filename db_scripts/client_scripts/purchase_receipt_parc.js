@@ -1,8 +1,13 @@
 // Client Script | Purchase Receipt | Form | "Purchase Advance Receipt Control - PR Dashboard"
-// Shows, before save, which draft PARC advances exist for the POs on this receipt and what each
-// expects, so the user knows what the submit will close. After submit, links the PARC it closed.
+// Needs the fuelbuddy_procurement app (the Advance (PARC) row field and the open-advances lookup).
+// Before submit: the supplier's open advances on this receipt's Purchase Orders, oldest payment
+// first, and which rows name them; submitting uses only the advances the rows name. After submit:
+// links the advances this receipt used.
 const PARC = "Purchase Advance Receipt Control";
+const FIELD = "custom_parc";
 const EXP = "qty_to_be_received_against_the_advance_paid";
+const OPEN_ADVANCES =
+	"fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control.purchase_advance_receipt_control.get_open_advances";
 
 function parc_pos(frm) {
 	return [...new Set((frm.doc.items || []).map((d) => d.purchase_order).filter(Boolean))];
@@ -14,40 +19,42 @@ async function show_parcs(frm) {
 	if (!pos.length) return;
 
 	if (frm.doc.docstatus === 1) {
-		const closed = await frappe.db.get_list(PARC, {
+		const used = await frappe.db.get_list(PARC, {
 			filters: { purchase_receipt: frm.doc.name, docstatus: 1 },
-			fields: ["name", "purchase_order", "qty_of_pr"],
+			fields: ["name", "purchase_order"],
 		});
-		if (closed.length) {
-			const links = closed.map((p) => `${frappe.utils.get_form_link(PARC, p.name, true)} (${p.purchase_order})`);
-			frm.dashboard.set_headline_alert(__("Closed PARC: {0}", [links.join(", ")]), "green");
+		if (used.length) {
+			const links = used.map((p) => `${frappe.utils.get_form_link(PARC, p.name, true)} (${p.purchase_order})`);
+			frm.dashboard.set_headline_alert(__("Advances used: {0}", [links.join(", ")]), "green");
 		}
 		return;
 	}
+	if (!frm.doc.supplier || frm.doc.is_return) return;
 
-	const drafts = await frappe.db.get_list(PARC, {
-		filters: { purchase_order: ["in", pos], docstatus: 0 },
-		fields: ["name", "purchase_order", EXP, "payment_entry"],
-		order_by: "creation asc",
-		limit: 50,
-	});
-	if (!drafts.length) return;
-
-	const qty_by_po = {};
+	const r = await frappe.call({ method: OPEN_ADVANCES, args: { supplier: frm.doc.supplier }, type: "GET" });
+	const open = r.message || [];
+	const rows_by_parc = {};
 	(frm.doc.items || []).forEach((d) => {
-		if (d.purchase_order) qty_by_po[d.purchase_order] = (qty_by_po[d.purchase_order] || 0) + flt(d.qty);
+		if (d[FIELD]) (rows_by_parc[d[FIELD]] = rows_by_parc[d[FIELD]] || []).push(d.idx);
 	});
 	const lines = pos
-		.filter((po) => drafts.some((p) => p.purchase_order === po))
 		.map((po) => {
-			const expected = drafts
+			const advances = open
 				.filter((p) => p.purchase_order === po)
-				.map((p) => `${frappe.utils.get_form_link(PARC, p.name, true)} expects ${format_number(p[EXP], null, 2)}`);
-			return __("{0}: this receipt {1} · pending advances: {2}", [
-				po, format_number(qty_by_po[po] || 0, null, 2), expected.join(", "),
-			]);
-		});
-	frm.dashboard.set_headline_alert(lines.join("<br>"), "orange");
+				.map((p) => {
+					const rows = rows_by_parc[p.name];
+					return __("{0} covers {1} {2} (paid {3}){4}", [
+						frappe.utils.get_form_link(PARC, p.name, true),
+						format_number(p[EXP], null, 3),
+						p.uom_of_item || "",
+						frappe.datetime.str_to_user(p.payment_date),
+						rows ? " · " + __("named on row {0}", [rows.join(", ")]) : "",
+					]);
+				});
+			return advances.length ? __("{0}: open advances, oldest payment first: {1}", [po, advances.join(", ")]) : null;
+		})
+		.filter(Boolean);
+	if (lines.length) frm.dashboard.set_headline_alert(lines.join("<br>"), "orange");
 }
 
 frappe.ui.form.on("Purchase Receipt", {
@@ -59,10 +66,11 @@ frappe.ui.form.on("Purchase Receipt", {
 			}, __("View"));
 		}
 	},
+	supplier(frm) { show_parcs(frm); },
 });
 
 frappe.ui.form.on("Purchase Receipt Item", {
 	purchase_order(frm) { show_parcs(frm); },
-	qty(frm) { show_parcs(frm); },
+	custom_parc(frm) { show_parcs(frm); },
 	items_remove(frm) { show_parcs(frm); },
 });

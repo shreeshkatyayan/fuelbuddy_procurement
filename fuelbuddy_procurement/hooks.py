@@ -6,21 +6,22 @@ app_email = "shantanu.mishra@fuelbuddy.in"
 app_license = "mit"
 
 after_install = "fuelbuddy_procurement.install.after_install"
+# Keeps the Purchase Receipt Item field (install.py) in step on sites that already have the app.
+after_migrate = "fuelbuddy_procurement.install.create_parc_fields"
 
 _PARC = "fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control.purchase_advance_receipt_control"
 
-# Submit/validate handlers ported from the DB Server Scripts of the same names (see README).
-# Server-script event labels map to controller hooks: "After Submit" -> on_submit,
-# "Before Validate" -> before_validate. The on_cancel handlers are new: the scripts never
-# unwound a PARC when its Payment Entry or Purchase Receipt was cancelled.
+# Payment Entry submit opens an advance (draft PARC); its cancel drops the drafts it opened.
+# A Purchase Receipt uses only the advances its rows name: checked on every save, closed on
+# submit, re-opened on cancel.
 doc_events = {
 	"Payment Entry": {
 		"on_submit": f"{_PARC}.create_parc_on_payment_entry",
 		"on_cancel": f"{_PARC}.delete_draft_parcs_on_payment_entry_cancel",
 	},
 	"Purchase Receipt": {
-		"before_validate": f"{_PARC}.warn_qty_mismatch_on_purchase_receipt",
-		"on_submit": f"{_PARC}.close_parc_on_purchase_receipt",
+		"validate": f"{_PARC}.check_named_parcs_on_purchase_receipt",
+		"on_submit": f"{_PARC}.close_named_parcs_on_purchase_receipt",
 		"on_cancel": f"{_PARC}.reopen_parc_on_purchase_receipt_cancel",
 	},
 }
