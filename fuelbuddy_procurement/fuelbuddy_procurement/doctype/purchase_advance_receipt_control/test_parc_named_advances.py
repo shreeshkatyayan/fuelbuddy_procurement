@@ -11,13 +11,20 @@ request would be.
 
 Needs a submitted Purchase Order to copy, a default bank or cash account on its company (for the
 payments), and the legacy PARC Server Scripts disabled. The other-supplier test also needs a
-submitted Purchase Order of a second supplier and is skipped without one.
+submitted Purchase Order of a second supplier and is skipped without one. Run it on a lab or
+staging site, never on production: it creates real documents and holds their locks while it runs.
+
+Two receipts submitted at the same time are covered on one connection only: one test skips the
+save check so that the submit's own locked re-read has to refuse the second receipt. A race across
+two connections is not tested, because a second connection cannot see this suite's uncommitted
+documents.
 
     bench --site <site> execute fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control.test_parc_named_advances.run
 """
 
 import sys
 import unittest
+from unittest import mock
 
 import frappe
 from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
@@ -26,6 +33,9 @@ from erpnext.stock.doctype.purchase_receipt.purchase_receipt import make_purchas
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, flt, getdate, nowdate
 
+from fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control import (
+	purchase_advance_receipt_control as parc_module,
+)
 from fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control.purchase_advance_receipt_control import (
 	EXPECTED,
 	PARC,
@@ -148,7 +158,7 @@ class TestParcNamedAdvances(FrappeTestCase):
 		self.assertAlmostEqual(
 			flt(named.qty_left_to_be_received_from_po), 1000.0 - _covered(named) - 7.0, delta=0.01
 		)
-		self.assertOpen(older)  # the receipt decides which advance is used, not the age
+		self.assertOpen(older)  # oldest-first is not enforced: the receipt decides which advance is used
 
 	def test_receipt_naming_nothing_closes_nothing(self):
 		po = _new_po(self.template)
@@ -194,6 +204,7 @@ class TestParcNamedAdvances(FrappeTestCase):
 		self.assertRefused(_receipt((po, half, parc.name), (po, half, parc.name)).insert, "more than one row")
 
 	def test_of_two_receipts_naming_one_advance_the_second_is_refused(self):
+		"""One after the other: the second submit is refused by the save check it runs first."""
 		po = _new_po(self.template)
 		parc = _pay(po, 0.4)
 		first, second = _receipt((po, _covered(parc), parc.name)), _receipt((po, _covered(parc), parc.name))
@@ -202,6 +213,21 @@ class TestParcNamedAdvances(FrappeTestCase):
 		first.submit()
 		self.assertRefused(second.submit, "already used", first.name)
 		self.assertRefused(_receipt((po, _covered(parc), parc.name)).insert, "already used", first.name)
+		self.assertEqual(_state(parc), (1, first.name))
+
+	def test_submit_rechecks_under_lock_what_the_save_check_let_through(self):
+		"""At the same time: both receipts pass the save check while the advance is still open.
+		Skipping that check on the second submit leaves the submit's locked re-read to refuse it."""
+		po = _new_po(self.template)
+		parc = _pay(po, 0.4)
+		first, second = _receipt((po, _covered(parc), parc.name)), _receipt((po, _covered(parc), parc.name))
+		first.insert()
+		second.insert()
+		first.submit()
+		save_check = mock.Mock(return_value=None)
+		with mock.patch.object(parc_module, "check_named_parcs_on_purchase_receipt", save_check):
+			self.assertRefused(second.submit, "already used", first.name)
+		save_check.assert_called()  # the save check really was skipped, so the refusal came on submit
 		self.assertEqual(_state(parc), (1, first.name))
 
 	def test_cancel_reopens_exactly_the_advances_the_receipt_used(self):

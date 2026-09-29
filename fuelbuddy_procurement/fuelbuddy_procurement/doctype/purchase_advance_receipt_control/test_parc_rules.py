@@ -21,8 +21,10 @@ from unittest import mock
 def _install_stand_in_frappe():
 	"""The few frappe names the modules under test use at import time or in the code tested here."""
 
-	class _dict(dict):
+	class _dict(dict):  # as frappe.types.frappedict._dict
+		__slots__ = ()
 		__getattr__ = dict.get
+		__setattr__ = dict.__setitem__
 
 	class ValidationError(Exception):
 		pass
@@ -89,6 +91,14 @@ def _advance(name="PARC-1", **overrides):
 			**overrides,
 		}
 	)
+
+
+def _closable(name="PARC-1", **overrides):
+	"""An advance whose close can be watched: `flags` and `submit()` as on a PARC document."""
+	parc = _advance(name, **overrides)
+	parc.flags = types.SimpleNamespace()
+	parc.submit = mock.Mock()
+	return parc
 
 
 def _row(idx=1, advance="PARC-1", **overrides):
@@ -160,8 +170,8 @@ class TestNamedAdvances(unittest.TestCase):
 			patch.start()
 			self.addCleanup(patch.stop)
 
-	def receipt(self, *rows, is_return=0):
-		return _dict(items=list(rows), supplier="SUP-1", is_return=is_return)
+	def receipt(self, *rows, is_return=0, **fields):
+		return _dict(items=list(rows), supplier="SUP-1", is_return=is_return, **fields)
 
 	def refused(self, doc):
 		with self.assertRaises(ParcRefusedError) as ctx:
@@ -205,6 +215,44 @@ class TestNamedAdvances(unittest.TestCase):
 			[mock.call(PARC, "PARC-1", for_update=True), mock.call(PARC, "PARC-2", for_update=True)],
 		)
 		self.assertEqual([(parc.name, row.idx) for parc, row in named], [("PARC-1", 2), ("PARC-2", 1)])
+
+	def test_submit_refuses_an_advance_its_locked_read_shows_used(self):
+		"""The save check saw the advance open; by submit another receipt has used it. The submit
+		goes by its own locked read: it refuses the receipt and closes nothing."""
+		open_at_save = _closable("PARC-1")
+		used_since = _closable("PARC-1", docstatus=1, purchase_receipt="PR-FIRST")
+		self.get_doc.side_effect = lambda doctype, name, for_update=False: (
+			used_since if for_update else open_at_save
+		)
+		doc = self.receipt(_row(), name="PR-SECOND")
+		parc_module.check_named_parcs_on_purchase_receipt(doc)
+		with self.assertRaises(ParcRefusedError) as ctx:
+			parc_module.close_named_parcs_on_purchase_receipt(doc)
+		self.assertIn("already used by Purchase Receipt PR-FIRST", str(ctx.exception))
+		open_at_save.submit.assert_not_called()
+		used_since.submit.assert_not_called()
+
+	def test_submit_closes_each_named_advance_once_with_its_rows_quantity(self):
+		closing = self.advances["PARC-1"] = _closable("PARC-1", qty_of_po=1000.0)
+		# Received to date on PO-1, this receipt's two rows included.
+		self.db.get_value.side_effect = lambda doctype, name, field: (
+			407.0 if doctype == "Purchase Receipt Item" else "SUP-1"
+		)
+		doc = self.receipt(_row(), _row(idx=2, advance=None, qty=7.0), name="PR-9", grand_total=4070.0)
+		with mock.patch.object(parc_module.frappe, "msgprint", create=True):
+			parc_module.close_named_parcs_on_purchase_receipt(doc)
+		self.get_doc.assert_called_once_with(PARC, "PARC-1", for_update=True)
+		closing.submit.assert_called_once_with()
+		self.assertTrue(closing.flags.ignore_permissions)
+		self.assertEqual(
+			(
+				closing.purchase_receipt,
+				closing.qty_of_pr,
+				closing.grand_total_of_pr,
+				closing.qty_left_to_be_received_from_po,
+			),
+			("PR-9", 400.0, 4070.0, 593.0),
+		)
 
 
 class TestWiring(unittest.TestCase):
