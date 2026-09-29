@@ -26,18 +26,27 @@ Code-first port of the customisations that lived in the site DB (custom DocType 
   must be open (not used by another receipt, not cancelled), an advance to the receipt's
   supplier, for the row's Purchase Order, counted in the row's unit, and exactly the row's
   quantity (within 0.01). Quantity beyond the advances goes on rows without an advance.
+- Oldest-first is not enforced here. A row may name any open advance on its Purchase Order, even
+  while an older advance of the same supplier is still open. `get_open_advances` lists them
+  oldest payment first for whoever books the receipt to follow.
 - Any failure refuses the whole receipt with `ParcRefusedError` (a `ValidationError`, HTTP 417),
   one line per row at fault. A name that does not exist, or a cancelled PARC, is refused first
   by Frappe's own link check.
-- Submit re-reads each named PARC under a row lock, so of two receipts naming one advance and
-  submitted together, the second is refused as already used.
+- Submit re-reads each named PARC under a row lock. A locking read sees the latest committed row,
+  so of two receipts naming one advance, the later one is refused as already used, even when both
+  passed the save check. The receipt's own posting in ERPNext runs before this and can still end
+  in a deadlock or lock wait timeout; the receipt is then not saved and can be sent again.
 - A return cannot name an advance, and does not re-open one.
 - Cancelling the receipt cancels the PARCs it closed and re-inserts each as a fresh draft (new
   name, same payment and Purchase Order), so the advance is open again.
+- Amending a cancelled receipt copies its old advance names (Frappe's Amend copies no-copy fields
+  too). Those PARCs are cancelled, so the save is refused until each row names the re-opened
+  advance.
 - A payment whose draft PARC is named on a draft receipt cannot be cancelled until that receipt
   stops naming it (Frappe's link check refuses the delete).
 
-On close, `qty_of_pr` is the row's quantity and `qty_left_to_be_received_from_po` is
+On close, `qty_of_pr` is the row's quantity, `grand_total_of_pr` is the receipt's grand total (the
+same figure on every advance that receipt closes), and `qty_left_to_be_received_from_po` is
 `PO qty - received to date` (every submitted receipt on the PO, this one included); the PARC is
 closed by a single `submit()`.
 
@@ -52,13 +61,17 @@ payments were entered, then PARC name): `name`, `purchase_order`, `payment_entry
 `payment_date`, `advance_paid`, `qty_to_be_received_against_the_advance_paid`, `uom_of_item`.
 Read-only, GET only, needs read permission on PARC.
 
+The PARC name only separates the advances of one payment split across Purchase Orders, and has no
+business meaning: under the site's PARC naming rule it is creation order, without the rule it is a
+random hash. The order is a suggestion; saving or submitting a receipt does not check it.
+
 ### Tests
 
 Both modules sit next to the controller.
 
 - `test_parc_rules.py` needs no bench: which row may use which advance, the refusal message,
-  the hooks wiring and the install field. It uses a stand-in `frappe` when the real one is not
-  installed.
+  what submit closes, the submit refusing what its locked re-read shows used, the hooks wiring
+  and the install field. It uses a stand-in `frappe` when the real one is not installed.
 
   ```bash
   python -m unittest fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control.test_parc_rules
@@ -67,11 +80,17 @@ Both modules sit next to the controller.
 - `test_parc_named_advances.py` runs the receipt's life on a site with ERPNext: named advances
   closing, each refusal, two receipts naming one advance, receipt cancel, payment cancel,
   returns, and the lookup's order. Each test copies the site's latest submitted PO so
-  company-specific mandatory fields come along. Everything is rolled back.
+  company-specific mandatory fields come along. Everything is rolled back. Use a lab or staging
+  site, never production: the tests create real documents and hold their locks while they run.
 
   ```bash
   bench --site <site> execute fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control.test_parc_named_advances.run
   ```
+
+  Two receipts submitted at the same time are tested on one connection: one test skips the save
+  check so the submit's locked re-read must refuse the second receipt. A race across two
+  connections is not tested, because a second connection cannot see the suite's uncommitted
+  documents.
 
 ### DB script equivalents
 

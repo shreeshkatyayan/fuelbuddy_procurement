@@ -12,7 +12,9 @@ fresh draft. Cancelling the Payment Entry deletes its draft PARCs; a PARC closed
 named on a draft receipt, blocks that cancel through Frappe's normal link check.
 
 ``get_open_advances`` lists a supplier's open advances, oldest payment first, for the GRN approval
-screen. ``hooks.py`` ``doc_events`` wires the handlers onto Payment Entry / Purchase Receipt.
+screen. That order is a suggestion: the receipt check does not enforce it, so a row may name any
+open advance on its Purchase Order even while an older one is open. ``hooks.py`` ``doc_events``
+wires the handlers onto Payment Entry / Purchase Receipt.
 """
 
 import frappe
@@ -117,8 +119,13 @@ def advance_refusal(parc, row, receipt_supplier, advance_supplier):
 
 def _named_advances(doc, for_update=False):
 	"""[(PARC, row)] for every advance the receipt's rows name, or ParcRefusedError listing every
-	row that cannot use its advance. With `for_update` each PARC stays locked until the transaction
-	ends; locks are taken in name order so two receipts naming the same advances cannot deadlock."""
+	row that cannot use its advance.
+
+	With `for_update` each named PARC is re-read under a row lock held until the transaction ends.
+	A locking read sees the latest committed row, so a PARC that another receipt has just closed
+	shows as used. The PARC locks are taken in name order. This does not rule out deadlocks: on
+	submit, ERPNext's own posting runs first and locks Purchase Order, stock and ledger rows, and
+	can still end in a deadlock or lock wait timeout, which the caller may retry."""
 	rows = sorted((d for d in doc.get("items") if d.get(PARC_FIELD)), key=lambda d: d.get(PARC_FIELD))
 	if rows and doc.get("is_return"):
 		frappe.throw(
@@ -156,8 +163,9 @@ def check_named_parcs_on_purchase_receipt(doc, method=None):
 
 # ---- Purchase Receipt: On Submit -> close exactly the advances the receipt names -----------
 def close_named_parcs_on_purchase_receipt(doc, method=None):
-	# Checked again under a row lock: of two receipts naming one advance and submitted together,
-	# the second waits here until the first commits, then is refused as already used.
+	# Runs after ERPNext's own Purchase Receipt on_submit (Frappe calls the controller first, then
+	# doc_events). The check is repeated on a locked re-read: of two receipts naming one advance,
+	# the later one is refused as already used, even when both passed the save check.
 	for parc, row in _named_advances(doc, for_update=True):
 		parc.purchase_receipt = doc.name
 		parc.qty_of_pr = row.qty
@@ -194,7 +202,10 @@ def reopen_parc_on_purchase_receipt_cancel(doc, method=None):
 @frappe.whitelist(methods=["GET"])
 def get_open_advances(supplier: str):
 	"""A supplier's open (draft) advances, oldest payment first: by the Payment Entry's posting
-	date, then the order the payments were entered. Read-only."""
+	date, then the order the payments were entered, then PARC name. The name only separates the
+	advances of one payment split across Purchase Orders and has no business meaning: it is
+	creation order under the site's PARC naming rule, a random hash without one. The order is a
+	suggestion; the receipt check does not enforce it. Read-only."""
 	frappe.has_permission(PARC, "read", throw=True)
 	parc = frappe.qb.DocType(PARC)
 	po = frappe.qb.DocType("Purchase Order")
