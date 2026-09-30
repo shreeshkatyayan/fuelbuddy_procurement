@@ -6,8 +6,7 @@ Purchase Advance Receipt Control (PARC): one row per supplier advance paid again
 Purchase Order, used up by the Purchase Receipts that name it, oldest advance first.
 
 Code-first port of the customisations that lived in the site DB (custom DocType in the
-*Buying* module plus DocType-Event Server Scripts). Extracted from the prod restore on
-2026-09-22.
+*Buying* module plus DocType-Event Server Scripts), extracted from a production site.
 
 | Event                      | Handler (doctype controller module)          | What it does |
 |----------------------------|----------------------------------------------|--------------|
@@ -43,8 +42,9 @@ On every save, and again on submit, a receipt is refused (`ParcRefusedError`, a
 - is on the row's Purchase Order and counted in the row's unit;
 - is booked for some quantity, but no more than it has left (within 0.01). The message says what is
   left and which receipt used it last;
-- is the supplier's **oldest advance with quantity left** within the receipt's company, and the only
-  advance the receipt names, on one row (see "Oldest first" below).
+- is the supplier's **oldest advance in line with quantity left** within the receipt's company, and
+  the only advance the receipt names, on one row (see "Oldest first" below). An advance whose
+  Purchase Order is Closed or On Hold is not in line.
 
 A return cannot name an advance and gives nothing back. A name that does not exist, or a cancelled
 PARC, is refused first by Frappe's own link check.
@@ -52,6 +52,14 @@ PARC, is refused first by Frappe's own link check.
 Quantity beyond what the advance has left goes on rows without an advance. Which purchase orders
 take it is the approver's choice; `get_open_purchase_orders` lists the supplier's open ones oldest
 first as a suggestion, and nothing checks the receipt against it.
+
+### How the caller uses it
+
+The purchase manager maps 100% of a receipt's quantity before approving it: the oldest advance in
+line first, then purchase orders, which `get_open_purchase_orders` suggests oldest first. The
+Purchase Receipt is created in ERPNext only after that mapping is complete. The calling application
+enforces this; this app does not check that a receipt's rows cover its whole quantity, and needs no
+rule for it.
 
 ### Oldest first
 
@@ -62,28 +70,33 @@ Order, which opens two advances on that order. Under the site's PARC naming rule
 creation order, without the rule it is a random hash.
 
 The rule for which advances a receipt may name lives in one function,
-`advances_a_receipt_may_name`. Today it returns the oldest advance with quantity left, and only
-that one: a receipt names at most one advance, and what it cannot book there does not spill onto the
-next advance. Returning more advances from that function lets a receipt name up to that many, one
-row each, in queue order.
+`advances_a_receipt_may_name`. Today it returns the oldest advance in line with quantity left, and
+only that one: a receipt names at most one advance, and what it cannot book there does not spill
+onto the next advance. Returning more advances from that function lets a receipt name up to that
+many, one row each, in queue order.
 
-An advance whose Purchase Order is Closed or On Hold keeps its place in the queue. ERPNext refuses a
-receipt against such an order, so until the order is re-opened or the advance is closed by other
-means, no receipt of that supplier can name an advance. The refusal says so, and the lookup returns
-`po_status`.
+An advance whose Purchase Order is Closed or On Hold is **skipped**: it does not count as an older
+advance, so the supplier's next advance in line can be named, and it cannot be named itself (ERPNext
+refuses a receipt against such an order anyway; the refusal says the advance is skipped). Once the
+order is re-opened or resumed, the advance takes its place in line again by its payment, ahead of
+newer advances. The skip is read from the order's status at every check (`skipped_in_queue`);
+nothing about it is stored on the advance. The lookup lists a skipped advance in its place with
+`skipped` true.
 
 ### Two receipts at the same time
 
 Submit re-reads, under a row lock held until the transaction ends, every advance the decision
-depends on: the supplier's advances queued ahead of the named one, then the named one, oldest first
-so that racing receipts lock in one order. Frappe loads the consumption rows with the same locking
-read. A locking read sees the latest committed rows, so of two receipts that both passed the save
-check, the later one is refused if the earlier one has used what it needs (the message names that
-receipt). The receipt's own posting in ERPNext runs before this step and can still end in a
-deadlock or lock wait timeout; nothing is saved then, and the receipt can be sent again.
+depends on: the supplier's advances in line ahead of the named one, then the named one, oldest first
+so that racing receipts lock in one order. Skipped advances are not locked. Frappe loads the
+consumption rows with the same locking read. A locking read sees the latest committed rows, so of
+two receipts that both passed the save check, the later one is refused if the earlier one has used
+what it needs (the message names that receipt). The receipt's own posting in ERPNext runs before
+this step and can still end in a deadlock or lock wait timeout; nothing is saved then, and the
+receipt can be sent again.
 
-What the submit's queue cannot see: an advance re-opened, or a payment made, by a transaction that
-commits while this one runs. The queue is read without locks.
+What the submit's queue cannot see: an advance re-opened, a payment made, or a Purchase Order
+closed, held or re-opened, by a transaction that commits while this one runs. The queue and the
+orders' statuses are read without locks.
 
 ### Design choice: a child table on PARC
 
@@ -125,8 +138,10 @@ GET /api/method/fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_adv
 
 The supplier's open advances with quantity left, oldest first: `name`, `purchase_order`,
 `payment_entry`, `payment_date`, `advance_paid`, `qty_to_be_received_against_the_advance_paid`,
-`qty_consumed`, `qty_remaining`, `uom_of_item`, `company`, `po_status`. The first is the only one
-the next receipt may name, for at most its `qty_remaining`. Needs read permission on PARC.
+`qty_consumed`, `qty_remaining`, `uom_of_item`, `company`, `po_status`, `skipped`. An advance whose
+Purchase Order is Closed or On Hold is listed in its place with `skipped` true. The first advance
+with `skipped` false is the only one the next receipt may name, for at most its `qty_remaining`.
+Needs read permission on PARC.
 
 ```
 GET /api/method/fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control.purchase_advance_receipt_control.get_open_purchase_orders?supplier=<Supplier ID>[&company=<Company>]
@@ -142,17 +157,19 @@ Needs read permission on Purchase Order.
 
 Both modules sit next to the controller.
 
-- `test_parc_rules.py` needs no bench: what an advance has left, each refusal, oldest first and one
-  advance per receipt, the submit deciding on locked reads, booking and closing, cancel giving back
-  and re-opening, the payment-cancel guard, the lookup's order, the hooks wiring, the DocType JSON
-  and the install fill. It uses a stand-in `frappe` when the real one is not installed.
+- `test_parc_rules.py` needs no bench: what an advance has left, each refusal, oldest first (skipping
+  advances on Closed or On Hold orders) and one advance per receipt, the submit deciding on locked
+  reads, booking and closing, cancel giving back and re-opening, the payment-cancel guard, the
+  lookup's order and skipped flag, the hooks wiring, the DocType JSON and the install fill. It uses
+  a stand-in `frappe` when the real one is not installed.
 
   ```bash
   python -m unittest fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receipt_control.test_parc_rules
   ```
 
 - `test_parc_named_advances.py` runs the receipt's life on a site with ERPNext: bit-by-bit use and
-  closing, overflow, each refusal, oldest first, two advances from one payment on payment terms,
+  closing, overflow, each refusal, oldest first, an advance skipped while its order is Closed or On
+  Hold and back in line once the order is re-opened, two advances from one payment on payment terms,
   two receipts for one advance, receipt cancel, payment cancel, returns and both lookups. Each test
   makes a supplier of its own (a copy of the latest submitted Purchase Order's supplier), so the
   site's real advances never queue ahead of the test's, and copies that Purchase Order so
@@ -192,7 +209,7 @@ the app.
 
 Open advances from before this change have no consumption rows, so each counts as unused and joins
 the oldest-first queue at its payment date. Review them before go-live: an old advance left open
-will be first in line.
+will be first in line, unless its order is Closed or On Hold.
 
 Record names (`PARC-26-27-000000001`) come from the site's **Document Naming Rule** (prefix
 `PARC.-.FY.-.`, 9 digits). That is data, not part of this app, and keeps working unchanged.
