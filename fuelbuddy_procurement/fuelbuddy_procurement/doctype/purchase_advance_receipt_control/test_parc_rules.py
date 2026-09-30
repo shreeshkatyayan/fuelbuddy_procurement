@@ -2,7 +2,8 @@
 # For license information, please see license.txt
 
 """Checks that need no site: what an advance has left, which receipt row may book against which
-advance (oldest first, one per receipt), how refusals are reported, what submit books and closes,
+advance (oldest first, skipping advances on Closed or On Hold orders, one per receipt), how refusals
+are reported, what submit books and closes,
 what a receipt cancel gives back or re-opens, the payment cancel guard, the lookup's order, the hooks
 wiring and the install field.
 
@@ -96,6 +97,7 @@ from fuelbuddy_procurement.fuelbuddy_procurement.doctype.purchase_advance_receip
 	advances_a_receipt_may_name,
 	consumed_qty,
 	remaining_qty,
+	skipped_in_queue,
 )
 
 _dict = frappe._dict
@@ -229,6 +231,12 @@ class TestReceiptRule(unittest.TestCase):
 		self.assertEqual(advances_a_receipt_may_name([oldest, newer, newest]), [oldest])
 		self.assertEqual(advances_a_receipt_may_name([]), [])
 
+	def test_the_queue_skips_only_advances_on_closed_or_held_orders(self):
+		for status in ("Closed", "On Hold"):
+			self.assertTrue(skipped_in_queue(_dict(po_status=status)), status)
+		for status in ("To Receive and Bill", "To Receive", "To Bill", "Completed", "Delivered", None):
+			self.assertFalse(skipped_in_queue(_dict(po_status=status)), status)
+
 
 class _ReceiptCase(unittest.TestCase):
 	"""A supplier (SUP-1) whose open advances are `self.advances`, queued in `self.queue` order."""
@@ -303,17 +311,42 @@ class TestNamedAdvances(_ReceiptCase):
 		message = self.refused(self.receipt(_row()))
 		self.assertIn("Row 1: advance PARC-1 is not the oldest advance of SUP-1 with quantity left", message)
 		self.assertIn("use PARC-OLD first (250.000 IG left on Purchase Order PO-0, paid 2026-09-01)", message)
-		self.assertNotIn("no receipt can be booked", message)
 
-	def test_an_oldest_advance_on_a_closed_or_held_order_stays_first_and_the_refusal_says_why(self):
+	def test_an_older_advance_on_a_closed_or_held_order_is_skipped(self):
 		for status in ("Closed", "On Hold"):
 			with self.subTest(status=status):
 				self.advances, self.queue = {}, []
 				self.add(_advance("PARC-OLD", purchase_order="PO-0"), po_status=status)
-				self.add(_advance("PARC-1"), days=1)
-				message = self.refused(self.receipt(_row()))
-				self.assertIn("use PARC-OLD first", message)
-				self.assertIn(f"Purchase Order PO-0 is {status}, so no receipt can be booked", message)
+				parc = self.add(_advance("PARC-1"), days=1)
+				row = _row()
+				self.assertEqual(parc_module._named_advances(self.receipt(row)), [(parc, row)])
+				# The next advance in line still has to wait its turn.
+				self.add(_advance("PARC-2", purchase_order="PO-2"), days=2)
+				message = self.refused(self.receipt(_row(advance="PARC-2", purchase_order="PO-2")))
+				self.assertIn("use PARC-1 first", message)
+
+	def test_a_skipped_advance_cannot_be_named_and_the_refusal_says_why(self):
+		self.add(_advance("PARC-OLD", purchase_order="PO-0"), po_status="On Hold")
+		skipped_alone = self.refused(self.receipt(_row(advance="PARC-OLD", purchase_order="PO-0")))
+		self.add(_advance("PARC-1"), days=1)
+		skipped_ahead = self.refused(self.receipt(_row(advance="PARC-OLD", purchase_order="PO-0")))
+		for message in (skipped_alone, skipped_ahead):
+			self.assertEqual(
+				message,
+				"Row 1: advance PARC-OLD is skipped while its Purchase Order PO-0 is On Hold; it takes its "
+				"place in line again once the order is re-opened",
+			)
+
+	def test_a_reopened_order_puts_its_advance_back_in_its_place(self):
+		"""The skip is read from the order's status at each check: nothing is stored on the advance."""
+		old = self.add(_advance("PARC-OLD", purchase_order="PO-0"), po_status="Closed")
+		self.add(_advance("PARC-1"), days=1)
+		self.assertEqual(len(parc_module._named_advances(self.receipt(_row()))), 1)
+		self.assertNotIn("skipped", old)
+		self.queue[0].po_status = "To Receive and Bill"  # the order is re-opened
+		self.assertIn("use PARC-OLD first (400.000 IG", self.refused(self.receipt(_row())))
+		row = _row(advance="PARC-OLD", purchase_order="PO-0")
+		self.assertEqual(parc_module._named_advances(self.receipt(row)), [(old, row)])
 
 	def test_payment_date_then_entry_order_then_name_decide_which_is_oldest(self):
 		self.add(_advance("PARC-B", purchase_order="PO-2"), days=0, created=5)
@@ -375,6 +408,13 @@ class TestSubmitRecheck(_ReceiptCase):
 			self.get_doc.call_args_list,
 			[mock.call(PARC, "PARC-Z", for_update=True), mock.call(PARC, "PARC-1", for_update=True)],
 		)
+
+	def test_submit_does_not_lock_advances_the_queue_skips(self):
+		self.add(_advance("PARC-HELD", purchase_order="PO-0"), po_status="On Hold")
+		self.add(_advance("PARC-1"), days=1)
+		named = parc_module._named_advances(self.receipt(_row()), for_update=True)
+		self.assertEqual([(parc.name, row.idx) for parc, row in named], [("PARC-1", 1)])
+		self.assertEqual(self.get_doc.call_args_list, [mock.call(PARC, "PARC-1", for_update=True)])
 
 	def test_submit_refuses_what_its_locked_read_shows_used_since_the_save(self):
 		"""The save check saw 400 left; by submit another receipt has booked 300. The submit goes by
@@ -589,19 +629,20 @@ class TestPaymentCancel(unittest.TestCase):
 
 class TestOpenAdvancesLookup(unittest.TestCase):
 	def setUp(self):
-		def row(name, days, created, expected=400.0):
+		def row(name, days, created, expected=400.0, po_status="To Receive and Bill"):
 			return _dict(
 				name=name,
 				payment_date=DAY + datetime.timedelta(days=days),
 				payment_created=datetime.datetime(2026, 9, 1, 8, 0, created),
 				uom_of_item="IG",
+				po_status=po_status,
 				**{EXPECTED: expected},
 			)
 
 		drafts = [
-			row("PARC-C", 2, 0),
+			row("PARC-C", 2, 0, po_status="On Hold"),
 			row("PARC-B2", 0, 5),
-			row("PARC-A", 0, 9),
+			row("PARC-A", 0, 9, po_status="Closed"),
 			row("PARC-B1", 0, 5),
 			row("PARC-E", 1, 0),
 		]
@@ -623,6 +664,18 @@ class TestOpenAdvancesLookup(unittest.TestCase):
 		self.assertEqual(rows[2].qty_consumed, 100.0)
 		self.assertNotIn("payment_created", rows[0])
 		parc_module.frappe.has_permission.assert_called_once_with(PARC, "read", throw=True)
+
+	def test_advances_on_closed_or_held_orders_are_listed_in_their_place_and_flagged_skipped(self):
+		rows = parc_module.get_open_advances("SUP-1")
+		self.assertEqual(
+			[(r.name, r.po_status, r.skipped) for r in rows],
+			[
+				("PARC-B1", "To Receive and Bill", False),
+				("PARC-B2", "To Receive and Bill", False),
+				("PARC-A", "Closed", True),
+				("PARC-C", "On Hold", True),
+			],
+		)
 
 
 class TestWiring(unittest.TestCase):

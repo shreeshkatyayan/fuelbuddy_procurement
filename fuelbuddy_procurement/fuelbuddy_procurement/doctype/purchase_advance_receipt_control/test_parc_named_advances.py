@@ -452,25 +452,42 @@ class TestParcPartialAdvances(FrappeTestCase):
 		self.assertAlmostEqual(flt(first.get(EXPECTED)), 100.0, delta=0.01)
 		self.assertAlmostEqual(flt(first.qty_consumed), 40.0, delta=0.01)
 		self.assertAlmostEqual(flt(first.qty_remaining), 60.0, delta=0.01)
-		self.assertEqual((first.company, first.po_status), (po_2.company, "To Receive and Bill"))
+		self.assertEqual(
+			(first.company, first.po_status, first.skipped), (po_2.company, "To Receive and Bill", False)
+		)
 		self.assertNotIn("payment_created", first)
 		_submit(_receipt((po_2, 60.0, oldest.name)))
 		self.assertEqual([row.name for row in get_open_advances(self.supplier)], [middle.name, newest.name])
 		self.assertEqual(get_open_advances(self.supplier, company="PARC test: no such company"), [])
 		self.assertEqual(get_open_advances("PARC test: no such supplier"), [])
 
-	def test_an_advance_on_a_closed_order_stays_first_in_line(self):
+	def test_an_advance_on_a_closed_or_held_order_is_skipped_until_the_order_is_reopened(self):
 		po_old, po_new = self.po(), self.po()
-		(older,) = _pay(po_old, 0.1, days_ago=2)
+		(older,) = _pay(po_old, 0.1, days_ago=2)  # 100 each
 		(newer,) = _pay(po_new, 0.1, days_ago=1)
-		update_status("Closed", po_old.name)
-		self.assertRefused(
-			_receipt((po_new, 50.0, newer.name)).insert,
-			f"use {older.name} first",
-			f"Purchase Order {po_old.name} is Closed, so no receipt can be booked against it",
-		)
-		first = get_open_advances(self.supplier)[0]
-		self.assertEqual((first.name, first.po_status), (older.name, "Closed"))
+		# ERPNext's own status changes: Close and Re-open, Hold and Resume.
+		for status, reopened in (("Closed", "Submitted"), ("On Hold", "Draft")):
+			update_status(status, po_old.name)
+			_submit(_receipt((po_new, 10.0, newer.name)))  # the older advance is skipped
+			rows = get_open_advances(self.supplier)
+			self.assertEqual(
+				[(row.name, row.po_status, row.skipped) for row in rows],
+				[(older.name, status, True), (newer.name, rows[1].po_status, False)],
+			)
+			update_status(reopened, po_old.name)  # back in its place, first in line
+			self.assertEqual(
+				frappe.db.get_value("Purchase Order", po_old.name, "status"), "To Receive and Bill"
+			)
+			self.assertRefused(
+				_receipt((po_new, 10.0, newer.name)).insert, f"use {older.name} first (100.000"
+			)
+			rows = get_open_advances(self.supplier)
+			self.assertEqual(
+				[(row.name, row.skipped) for row in rows], [(older.name, False), (newer.name, False)]
+			)
+		self.assertAlmostEqual(_left(newer), 80.0, delta=0.01)
+		_submit(_receipt((po_old, 100.0, older.name)))
+		self.assertEqual(_state(older)[0], 1)
 
 	def test_open_purchase_orders_are_suggested_oldest_first(self):
 		newer = self.po(days_ago=1)
