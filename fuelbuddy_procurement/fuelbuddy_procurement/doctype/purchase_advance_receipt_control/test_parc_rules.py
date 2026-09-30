@@ -146,7 +146,7 @@ def _row(idx=1, advance="PARC-1", **overrides):
 	)
 
 
-def _queued(parc, days=0, created=0):
+def _queued(parc, days=0, created=0, po_status="To Receive and Bill"):
 	"""`parc` as the supplier's queue lists it: paid `days` after DAY, entered `created` seconds in."""
 	return _dict(
 		name=parc.name,
@@ -155,6 +155,7 @@ def _queued(parc, days=0, created=0):
 		payment_created=datetime.datetime(2026, 9, 1, 8, 0, created),
 		uom_of_item=parc.uom_of_item,
 		qty_remaining=remaining_qty(parc),
+		po_status=po_status,
 	)
 
 
@@ -259,10 +260,10 @@ class _ReceiptCase(unittest.TestCase):
 			return found
 		return self.advances[name]
 
-	def add(self, parc, days=0, created=0):
+	def add(self, parc, days=0, created=0, **queued):
 		"""`parc` is an open advance of SUP-1, queued as paid `days` after the others' first day."""
 		self.advances[parc.name] = parc
-		self.queue.append(_queued(parc, days, created))
+		self.queue.append(_queued(parc, days, created, **queued))
 		self.queue.sort(key=parc_module._oldest_first)
 		return parc
 
@@ -302,6 +303,17 @@ class TestNamedAdvances(_ReceiptCase):
 		message = self.refused(self.receipt(_row()))
 		self.assertIn("Row 1: advance PARC-1 is not the oldest advance of SUP-1 with quantity left", message)
 		self.assertIn("use PARC-OLD first (250.000 IG left on Purchase Order PO-0, paid 2026-09-01)", message)
+		self.assertNotIn("no receipt can be booked", message)
+
+	def test_an_oldest_advance_on_a_closed_or_held_order_stays_first_and_the_refusal_says_why(self):
+		for status in ("Closed", "On Hold"):
+			with self.subTest(status=status):
+				self.advances, self.queue = {}, []
+				self.add(_advance("PARC-OLD", purchase_order="PO-0"), po_status=status)
+				self.add(_advance("PARC-1"), days=1)
+				message = self.refused(self.receipt(_row()))
+				self.assertIn("use PARC-OLD first", message)
+				self.assertIn(f"Purchase Order PO-0 is {status}, so no receipt can be booked", message)
 
 	def test_payment_date_then_entry_order_then_name_decide_which_is_oldest(self):
 		self.add(_advance("PARC-B", purchase_order="PO-2"), days=0, created=5)

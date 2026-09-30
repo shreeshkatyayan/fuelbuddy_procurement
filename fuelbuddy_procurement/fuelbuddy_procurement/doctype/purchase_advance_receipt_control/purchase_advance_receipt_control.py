@@ -40,6 +40,8 @@ EXPECTED = "qty_to_be_received_against_the_advance_paid"
 PARC_FIELD = "custom_parc"
 # Quantities closer than this are treated as equal (float dust).
 QTY_EPSILON = 0.01
+# ERPNext refuses a Purchase Receipt against a Purchase Order in these states.
+PO_STATUSES_TAKING_NO_RECEIPT = ("Closed", "On Hold")
 
 
 class PurchaseAdvanceReceiptControl(Document):
@@ -202,7 +204,7 @@ def _order_refusal(name, accepted, allowed, supplier):
 			"this quantity on a row without an advance"
 		).format(len(allowed), first_row.idx, first.name)
 	oldest = allowed[len(accepted)]
-	return _(
+	reason = _(
 		"is not the oldest advance of {0} with quantity left: use {1} first ({2:.3f} {3} left on "
 		"Purchase Order {4}, paid {5})"
 	).format(
@@ -213,6 +215,12 @@ def _order_refusal(name, accepted, allowed, supplier):
 		oldest.purchase_order,
 		oldest.payment_date,
 	)
+	if oldest.get("po_status") in PO_STATUSES_TAKING_NO_RECEIPT:
+		# Still first in line: the rule does not skip it. Say why no receipt can use it as things stand.
+		reason += _(
+			". Purchase Order {0} is {1}, so no receipt can be booked against it as it stands"
+		).format(oldest.purchase_order, oldest.po_status)
+	return reason
 
 
 def _named_advances(doc, for_update=False):
@@ -344,6 +352,7 @@ def _draft_advances(supplier, company=None):
 			parc[EXPECTED],
 			parc.uom_of_item,
 			po.company,
+			po.status.as_("po_status"),
 		)
 		.where((parc.docstatus == 0) & (pe.docstatus == 1) & (po.supplier == supplier))
 	)
@@ -465,8 +474,9 @@ def _reopen(parc, receipt):
 def get_open_advances(supplier: str, company: str | None = None):
 	"""A supplier's open advances with quantity left, oldest first (see ``_supplier_advances``): name,
 	purchase_order, payment_entry, payment_date, advance_paid, the advance's quantity, qty_consumed,
-	qty_remaining, uom_of_item, company. The first is the only one the next receipt may name, for at
-	most its qty_remaining. Read-only."""
+	qty_remaining, uom_of_item, company, po_status. The first is the only one the next receipt may name,
+	for at most its qty_remaining. An advance whose Purchase Order is Closed or On Hold stays in line
+	(the rule does not skip it); po_status shows it. Read-only."""
 	frappe.has_permission(PARC, "read", throw=True)
 	return [
 		frappe._dict({key: value for key, value in adv.items() if key != "payment_created"})
