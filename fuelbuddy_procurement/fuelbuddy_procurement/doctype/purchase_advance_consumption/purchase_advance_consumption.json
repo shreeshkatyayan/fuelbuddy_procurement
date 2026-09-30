@@ -1,0 +1,66 @@
+{
+ "actions": [],
+ "creation": "2026-09-30 12:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "purchase_receipt",
+  "posting_date",
+  "qty",
+  "is_active",
+  "purchase_receipt_item"
+ ],
+ "fields": [
+  {
+   "description": "Plain text, not a link: the receipt may since have been cancelled, and a link to a cancelled document would block every later save of the advance.",
+   "fieldname": "purchase_receipt",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Purchase Receipt",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Receipt Date",
+   "read_only": 1
+  },
+  {
+   "fieldname": "qty",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Qty",
+   "read_only": 1
+  },
+  {
+   "default": "1",
+   "description": "Cleared when the receipt is cancelled: its quantity is back on the advance.",
+   "fieldname": "is_active",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Active",
+   "read_only": 1
+  },
+  {
+   "fieldname": "purchase_receipt_item",
+   "fieldtype": "Data",
+   "label": "Purchase Receipt Item",
+   "read_only": 1
+  }
+ ],
+ "istable": 1,
+ "links": [],
+ "modified": "2026-09-30 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Fuelbuddy Procurement",
+ "name": "Purchase Advance Consumption",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

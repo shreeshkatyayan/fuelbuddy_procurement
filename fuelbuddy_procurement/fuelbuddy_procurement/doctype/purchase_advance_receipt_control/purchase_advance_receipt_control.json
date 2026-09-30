@@ -28,7 +28,12 @@
   "qty_left_to_be_received_from_po",
   "advance_paid",
   "column_break_vbng",
-  "qty_to_be_received_against_the_advance_paid"
+  "qty_to_be_received_against_the_advance_paid",
+  "consumption_section",
+  "qty_consumed",
+  "column_break_qtyc",
+  "qty_remaining",
+  "consumptions"
  ],
  "fields": [
   {
@@ -171,13 +176,44 @@
    "in_list_view": 1,
    "label": "Qty to be received against the advance paid",
    "read_only": 1
+  },
+  {
+   "fieldname": "consumption_section",
+   "fieldtype": "Section Break",
+   "label": "Use by Purchase Receipts"
+  },
+  {
+   "description": "Sum of the active rows below.",
+   "fieldname": "qty_consumed",
+   "fieldtype": "Float",
+   "label": "Qty used by receipts",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_qtyc",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Qty to be received against the advance paid, minus Qty used by receipts. The advance closes (is submitted) when this reaches zero.",
+   "fieldname": "qty_remaining",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Qty left on the advance",
+   "read_only": 1
+  },
+  {
+   "fieldname": "consumptions",
+   "fieldtype": "Table",
+   "label": "Receipts that used this advance",
+   "options": "Purchase Advance Consumption",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-09-22 18:30:46.000000",
+ "modified": "2026-09-30 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Fuelbuddy Procurement",
  "name": "Purchase Advance Receipt Control",
