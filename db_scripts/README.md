@@ -2,10 +2,11 @@
 
 Pasteable **Server Script** bodies for a site that cannot take the app yet. They cover the Payment
 Entry side and the receipt cancel only. A receipt uses an advance by naming it on a row, and that
-needs the app: the row field (Purchase Receipt Item `custom_parc`), the check on save and the close
-on submit exist only there. Bodies are written for the Server Script sandbox: no imports, no
-`str.format`, no `_`-prefixed names. Keep either the app **or** these enabled, never both;
-`after_install` disables all five script names listed in `install.py`.
+needs the app: the row field (Purchase Receipt Item `custom_parc`), the consumption table on PARC
+(Purchase Advance Consumption), the checks on save and submit, and the booking on submit exist only
+there. Bodies are written for the Server Script sandbox: no imports, no `str.format`, no
+`_`-prefixed names. Keep either the app **or** these enabled, never both; `after_install` disables
+all five script names listed in `install.py`.
 
 | Server Script name (paste as-is)                          | Ref DocType      | Event           | Body |
 |-----------------------------------------------------------|------------------|-----------------|------|
@@ -19,11 +20,21 @@ Validate; note the double space) and "Purchase Advance Receipt Control Purchase 
 Submit) pick an advance by quantity (nearest within +/-20%). Disable them: nothing replaces them
 outside the app.
 
+Without the app an advance is only ever closed whole (by the legacy matcher), so the two cancel
+bodies know nothing of partial use:
+
+- The receipt-cancel body re-opens an advance a receipt closed, in full, as a fresh draft.
+- The payment-cancel body deletes the payment's draft advances without checking for receipts that
+  used part of one. The app refuses that cancel instead.
+
 | Client Script name                                | DocType          | View | Body |
 |---------------------------------------------------|------------------|------|------|
 | Purchase Advance Receipt Control - PR Dashboard   | Purchase Receipt | Form | `client_scripts/purchase_receipt_parc.js` |
 
-The client script is UI only and needs the app (it reads the open-advances lookup). Before submit it
-lists the supplier's open advances on the receipt's Purchase Orders, oldest payment first, and which
-rows name them; after submit it links the advances the receipt used; it also adds a View > PARC
-button. Nothing is needed on the PARC form itself: every field is read-only.
+The client script is UI only and needs the app (it reads the two lookups). Before submit it shows
+the supplier's oldest advance with quantity left, which is the only one the receipt may name, with
+what it has left; flags rows naming another advance; lists the advances queued behind it; and
+suggests the supplier's open purchase orders, oldest first, for the rest of the receipt. After
+submit it lists what each row booked against which advance. It adds a View > PARC button, and shows
+nothing to users who cannot read PARC. Nothing is needed on the PARC form itself: every field is
+read-only.
