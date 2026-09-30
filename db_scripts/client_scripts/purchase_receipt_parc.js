@@ -1,8 +1,9 @@
 // Client Script | Purchase Receipt | Form | "Purchase Advance Receipt Control - PR Dashboard"
 // Needs the fuelbuddy_procurement app (the Advance (PARC) row field and the two lookups).
-// Before submit: the supplier's oldest advance with quantity left, which is the only one this
-// receipt may name (on one row, for at most what it has left), the advances queued behind it, and
-// the supplier's open purchase orders oldest first as a suggestion for the rest of the receipt.
+// Before submit: the supplier's oldest advance in line with quantity left, which is the only one
+// this receipt may name (on one row, for at most what it has left), the advances queued behind it,
+// the advances skipped while their order is Closed or On Hold, and the supplier's open purchase
+// orders oldest first as a suggestion for the rest of the receipt.
 // After submit: the advances the rows named. Shows nothing to users who cannot read PARC or POs.
 const PARC = "Purchase Advance Receipt Control";
 const FIELD = "custom_parc";
@@ -48,25 +49,32 @@ async function show_parcs(frm) {
 	if (frm.doc.docstatus !== 0) return;
 
 	const open = await parc_lookup(frm, "get_open_advances");
+	const in_line = open.filter((p) => !p.skipped);
+	const skipped = open.filter((p) => p.skipped);
 	const lines = [];
-	if (open.length) {
-		const [oldest, ...queued] = open;
+	if (in_line.length) {
+		const [oldest, ...queued] = in_line;
 		lines.push(
-			__("Oldest advance with quantity left: {0}, {1} left on {2} (paid {3}{4}). Only this advance may be named, on one row, for at most what it has left.", [
+			__("Oldest advance in line: {0}, {1} left on {2} (paid {3}). Only this advance may be named, on one row, for at most what it has left.", [
 				parc_link(oldest.name),
 				parc_qty(oldest.qty_remaining, oldest.uom_of_item),
 				oldest.purchase_order,
 				frappe.datetime.str_to_user(oldest.payment_date),
-				["Closed", "On Hold"].includes(oldest.po_status) ? ", " + __("order {0}", [oldest.po_status]) : "",
 			])
 		);
-		named
-			.filter((d) => d[FIELD] !== oldest.name)
-			.forEach((d) => lines.push(__("Row {0} names {1}: it will be refused.", [d.idx, d[FIELD]])));
 		if (queued.length) {
 			const behind = queued.map((p) => `${parc_link(p.name)} (${parc_qty(p.qty_remaining, p.uom_of_item)})`);
 			lines.push(__("Queued behind it: {0}", [behind.join(", ")]));
 		}
+	}
+	if (skipped.length) {
+		const passed = skipped.map((p) => `${parc_link(p.name)} (${p.purchase_order} ${p.po_status})`);
+		lines.push(__("Skipped until their order is re-opened: {0}", [passed.join(", ")]));
+	}
+	if (open.length) {
+		named
+			.filter((d) => !in_line.length || d[FIELD] !== in_line[0].name)
+			.forEach((d) => lines.push(__("Row {0} names {1}: it will be refused.", [d.idx, d[FIELD]])));
 	}
 	if (frappe.model.can_read("Purchase Order")) {
 		const pos = await parc_lookup(frm, "get_open_purchase_orders");

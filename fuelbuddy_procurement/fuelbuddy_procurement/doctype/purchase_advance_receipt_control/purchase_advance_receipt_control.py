@@ -17,8 +17,10 @@ deliveries, so Purchase Receipts use it up bit by bit:
   PARC is re-opened: Frappe cannot move a submitted document back to draft, so it is cancelled and
   a fresh draft copy is inserted with every row (the cancelled receipt's now inactive).
 - Oldest advance first is enforced, on save and again on submit: a receipt may name only its
-  supplier's oldest advance with quantity left, and only one (``advances_a_receipt_may_name``). The
-  rest of the receipt goes on rows without an advance.
+  supplier's oldest advance in line with quantity left, and only one (``advances_a_receipt_may_name``).
+  An advance whose Purchase Order is Closed or On Hold is skipped, read from the order's status at
+  every check, and takes its place again once the order is re-opened (``skipped_in_queue``). The rest
+  of the receipt goes on rows without an advance.
 - Cancelling the Payment Entry deletes its draft PARCs, or is refused while a receipt uses one.
 
 ``get_open_advances`` lists a supplier's open advances oldest first with what each has left, and
@@ -40,7 +42,8 @@ EXPECTED = "qty_to_be_received_against_the_advance_paid"
 PARC_FIELD = "custom_parc"
 # Quantities closer than this are treated as equal (float dust).
 QTY_EPSILON = 0.01
-# ERPNext refuses a Purchase Receipt against a Purchase Order in these states.
+# ERPNext refuses a Purchase Receipt against a Purchase Order in these states, so the oldest-first
+# queue skips an advance on such an order until the order is re-opened.
 PO_STATUSES_TAKING_NO_RECEIPT = ("Closed", "On Hold")
 
 
@@ -139,9 +142,17 @@ def _receipts_using(parc):
 
 
 # ---- Purchase Receipt: which advances a receipt may name -----------------------------------
+def skipped_in_queue(adv):
+	"""True while the advance's Purchase Order is Closed or On Hold: the oldest-first queue passes over
+	it, and it takes its place again, by its payment, once the order is re-opened. `adv` is a queue
+	entry (``_supplier_advances``), whose ``po_status`` is the order's status as this check reads it;
+	nothing about the skip is stored."""
+	return adv.get("po_status") in PO_STATUSES_TAKING_NO_RECEIPT
+
+
 def advances_a_receipt_may_name(open_advances):
-	"""The advances one receipt may name, out of `open_advances` (the supplier's advances with quantity
-	left, oldest first).
+	"""The advances one receipt may name, out of `open_advances` (the supplier's advances in line with
+	quantity left, oldest first; skipped ones are not in it).
 
 	Working rule, kept in this one function so that it can be switched: the oldest advance, and only
 	that one. The rest of the receipt goes on rows without an advance and is mapped to purchase orders
@@ -188,13 +199,18 @@ def _last_receipt(parc):
 	return rows[-1].purchase_receipt if rows else None
 
 
-def _order_refusal(name, accepted, allowed, supplier):
+def _order_refusal(name, accepted, allowed, supplier, skipped=None):
 	"""Why the receipt may not name advance `name` under ``advances_a_receipt_may_name``, or None.
 
 	`accepted`: [(PARC, row)] this receipt already uses on earlier rows; `allowed`: what the rule
-	lets it name, oldest first."""
+	lets it name, oldest first; `skipped`: the advance's queue entry when the queue skips it."""
 	if name in [adv.name for adv in allowed]:
 		return None
+	if skipped:
+		return _(
+			"is skipped while its Purchase Order {0} is {1}; it takes its place in line again once the "
+			"order is re-opened"
+		).format(skipped.purchase_order, skipped.po_status)
 	if not allowed:
 		return _("is not an open advance of {0} for this receipt's company").format(supplier)
 	if len(accepted) >= len(allowed):
@@ -204,7 +220,7 @@ def _order_refusal(name, accepted, allowed, supplier):
 			"this quantity on a row without an advance"
 		).format(len(allowed), first_row.idx, first.name)
 	oldest = allowed[len(accepted)]
-	reason = _(
+	return _(
 		"is not the oldest advance of {0} with quantity left: use {1} first ({2:.3f} {3} left on "
 		"Purchase Order {4}, paid {5})"
 	).format(
@@ -215,12 +231,6 @@ def _order_refusal(name, accepted, allowed, supplier):
 		oldest.purchase_order,
 		oldest.payment_date,
 	)
-	if oldest.get("po_status") in PO_STATUSES_TAKING_NO_RECEIPT:
-		# Still first in line: the rule does not skip it. Say why no receipt can use it as things stand.
-		reason += _(
-			". Purchase Order {0} is {1}, so no receipt can be booked against it as it stands"
-		).format(oldest.purchase_order, oldest.po_status)
-	return reason
 
 
 def _named_advances(doc, for_update=False):
@@ -228,15 +238,18 @@ def _named_advances(doc, for_update=False):
 	fault, one line each. A return cannot name an advance.
 
 	Each named advance must pass ``advance_refusal`` and ``advances_a_receipt_may_name``: today one
-	advance, named on one row, the supplier's oldest with quantity left within the receipt's company.
+	advance, named on one row, the supplier's oldest in line with quantity left within the receipt's
+	company. Advances the queue skips (``skipped_in_queue``) are left out of the line, so they neither
+	block a newer advance nor may be named.
 
 	With `for_update` (on submit) every PARC the decision reads is re-read under a row lock held until
-	the transaction ends: the supplier's open advances queued ahead of the named one, then the named
+	the transaction ends: the supplier's open advances in line ahead of the named one, then the named
 	one, oldest first so that receipts racing for the same advances lock them in one order. A locking
 	read sees the latest committed rows, so an advance that another receipt has just used up, or used
 	part of, shows as such and this receipt is refused. What it cannot see: an advance re-opened
-	(re-inserted) or paid by a transaction that commits while this one runs. ERPNext's own posting
-	runs before this and can still end in a deadlock or lock wait timeout; nothing is saved then."""
+	(re-inserted) or paid, or a Purchase Order closed, held or re-opened, by a transaction that commits
+	while this one runs. ERPNext's own posting runs before this and can still end in a deadlock or lock
+	wait timeout; nothing is saved then."""
 	rows = [row for row in doc.get("items") or [] if row.get(PARC_FIELD)]
 	if not rows:
 		return []
@@ -245,8 +258,10 @@ def _named_advances(doc, for_update=False):
 			_("A return cannot use an advance (PARC); clear Advance (PARC) on its rows."), ParcRefusedError
 		)
 	queue = _supplier_advances(doc.supplier, doc.company)
-	parcs = _read_advances(list(dict.fromkeys(row.get(PARC_FIELD) for row in rows)), queue, for_update)
-	allowed = advances_a_receipt_may_name(_with_quantity_left(queue, parcs))
+	line = [adv for adv in queue if not skipped_in_queue(adv)]
+	skipped = {adv.name: adv for adv in queue if skipped_in_queue(adv)}
+	parcs = _read_advances(list(dict.fromkeys(row.get(PARC_FIELD) for row in rows)), line, for_update)
+	allowed = advances_a_receipt_may_name(_with_quantity_left(line, parcs))
 	named, errors, seen = [], [], set()
 	for row in rows:
 		name = row.get(PARC_FIELD)
@@ -261,7 +276,7 @@ def _named_advances(doc, for_update=False):
 				"Purchase Order", parc.purchase_order, "supplier"
 			)
 			reason = advance_refusal(parc, row, doc.supplier, supplier) or _order_refusal(
-				name, named, allowed, doc.supplier
+				name, named, allowed, doc.supplier, skipped.get(name)
 			)
 			if reason:
 				errors.append((row.idx, f"{where} {reason}"))
@@ -274,12 +289,13 @@ def _named_advances(doc, for_update=False):
 	return named
 
 
-def _read_advances(names, queue, for_update):
-	"""{name: PARC or None} for the named advances and, on submit, for the supplier's open advances
-	queued ahead of them. On submit every read is a locking read, in one order: the queued advances
-	oldest first up to the newest named one, then any named advance not in the queue, by name."""
+def _read_advances(names, line, for_update):
+	"""{name: PARC or None} for the named advances and, on submit, for the supplier's advances in line
+	ahead of them (`line`: the queue without the skipped ones). On submit every read is a locking read,
+	in one order: the advances in line oldest first up to the newest named one, then any named advance
+	not in line, by name."""
 	if for_update:
-		order = [adv.name for adv in queue]
+		order = [adv.name for adv in line]
 		ahead = max((order.index(name) for name in names if name in order), default=-1)
 		names = order[: ahead + 1] + sorted(name for name in names if name not in order)
 	return {name: _read(name, for_update) for name in names}
@@ -296,11 +312,11 @@ def _read(name, for_update=False):
 		return None
 
 
-def _with_quantity_left(queue, parcs):
-	"""The queue (oldest first) cut to the advances with quantity left, taking each advance's state
+def _with_quantity_left(line, parcs):
+	"""The advances in line (oldest first) cut to those with quantity left, taking each advance's state
 	from `parcs` where it was read (under lock on submit), from the queue's snapshot otherwise."""
 	left = []
-	for adv in queue:
+	for adv in line:
 		if adv.name in parcs:
 			parc = parcs[adv.name]
 			if parc is None or parc.docstatus != 0:
@@ -312,8 +328,8 @@ def _with_quantity_left(queue, parcs):
 
 
 def _supplier_advances(supplier, company=None):
-	"""The supplier's open (draft) advances, oldest first, each with qty_consumed and qty_remaining,
-	as this transaction's snapshot shows them.
+	"""The supplier's open (draft) advances, oldest first, each with qty_consumed, qty_remaining,
+	po_status and skipped (``skipped_in_queue``), as this transaction's snapshot shows them.
 
 	Oldest first: the Payment Entry's posting date, then the order the payments were entered
 	(creation), then PARC name. The name only orders the advances one payment opened (on several
@@ -324,6 +340,7 @@ def _supplier_advances(supplier, company=None):
 	for adv in advances:
 		adv.qty_consumed = used.get(adv.name, 0.0)
 		adv.qty_remaining = flt(adv.get(EXPECTED)) - adv.qty_consumed
+		adv.skipped = skipped_in_queue(adv)
 	return sorted(advances, key=_oldest_first)
 
 
@@ -474,9 +491,10 @@ def _reopen(parc, receipt):
 def get_open_advances(supplier: str, company: str | None = None):
 	"""A supplier's open advances with quantity left, oldest first (see ``_supplier_advances``): name,
 	purchase_order, payment_entry, payment_date, advance_paid, the advance's quantity, qty_consumed,
-	qty_remaining, uom_of_item, company, po_status. The first is the only one the next receipt may name,
-	for at most its qty_remaining. An advance whose Purchase Order is Closed or On Hold stays in line
-	(the rule does not skip it); po_status shows it. Read-only."""
+	qty_remaining, uom_of_item, company, po_status, skipped. An advance whose Purchase Order is Closed
+	or On Hold is listed in its place with skipped true: the queue passes over it until the order is
+	re-opened. The first advance with skipped false is the only one the next receipt may name, for at
+	most its qty_remaining. Read-only."""
 	frappe.has_permission(PARC, "read", throw=True)
 	return [
 		frappe._dict({key: value for key, value in adv.items() if key != "payment_created"})

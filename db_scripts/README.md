@@ -32,9 +32,9 @@ bodies know nothing of partial use:
 | Purchase Advance Receipt Control - PR Dashboard   | Purchase Receipt | Form | `client_scripts/purchase_receipt_parc.js` |
 
 The client script is UI only and needs the app (it reads the two lookups). Before submit it shows
-the supplier's oldest advance with quantity left, which is the only one the receipt may name, with
-what it has left; flags rows naming another advance; lists the advances queued behind it; and
-suggests the supplier's open purchase orders, oldest first, for the rest of the receipt. After
-submit it lists what each row booked against which advance. It adds a View > PARC button, and shows
-nothing to users who cannot read PARC. Nothing is needed on the PARC form itself: every field is
-read-only.
+the supplier's oldest advance in line with quantity left, which is the only one the receipt may
+name, with what it has left; lists the advances queued behind it and those skipped while their
+order is Closed or On Hold; flags rows naming another advance; and suggests the supplier's open
+purchase orders, oldest first, for the rest of the receipt. After submit it lists what each row
+booked against which advance. It adds a View > PARC button, and shows nothing to users who cannot
+read PARC. Nothing is needed on the PARC form itself: every field is read-only.
