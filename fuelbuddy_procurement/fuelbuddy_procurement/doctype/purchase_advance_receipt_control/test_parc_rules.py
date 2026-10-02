@@ -238,6 +238,18 @@ class TestReceiptRule(unittest.TestCase):
 			self.assertFalse(skipped_in_queue(_dict(po_status=status)), status)
 
 
+def _msgprint(msg, *args, raise_exception=False, **kwargs):
+	"""As frappe.msgprint without the page message. It still raises when asked to, because the real
+	frappe.throw raises through msgprint."""
+	if not raise_exception:
+		return
+	if isinstance(raise_exception, type) and issubclass(raise_exception, Exception):
+		raise raise_exception(msg)
+	if isinstance(raise_exception, Exception):
+		raise raise_exception
+	raise parc_module.frappe.ValidationError(msg)
+
+
 class _ReceiptCase(unittest.TestCase):
 	"""A supplier (SUP-1) whose open advances are `self.advances`, queued in `self.queue` order."""
 
@@ -252,7 +264,7 @@ class _ReceiptCase(unittest.TestCase):
 		patches = [
 			mock.patch.object(parc_module.frappe, "db", self.db, create=True),
 			mock.patch.object(parc_module.frappe, "get_doc", self.get_doc, create=True),
-			mock.patch.object(parc_module.frappe, "msgprint", create=True),
+			mock.patch.object(parc_module.frappe, "msgprint", _msgprint, create=True),
 			mock.patch.object(parc_module.frappe, "clear_last_message", create=True),
 			mock.patch.object(parc_module, "_supplier_advances", lambda supplier, company: self.queue),
 		]
