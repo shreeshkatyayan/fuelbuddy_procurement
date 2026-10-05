@@ -3,33 +3,69 @@
 
 """Purchase Advance Receipt Control (PARC).
 
-One PARC row per supplier advance: created when a Payment Entry (Pay -> Supplier) is
-submitted against a Purchase Order, and closed (submitted) when the matching Purchase
-Receipt arrives. Cancelling the Purchase Receipt cancels the PARC and re-opens the advance
-as a fresh draft; cancelling the Payment Entry deletes its draft PARCs (a PARC already
-closed by a receipt blocks the cancel through Frappe's normal link check).
+One PARC per supplier advance: a draft created when a Payment Entry (Pay -> Supplier) is submitted
+against a Purchase Order, for the quantity that advance pays for. An advance usually covers several
+deliveries, so Purchase Receipts use it up bit by bit:
 
-``hooks.py`` ``doc_events`` wires the handlers onto Payment Entry / Purchase Receipt.
+- A receipt row names the advance it books against (Purchase Receipt Item ``custom_parc``, created
+  by ``install.py``) and books at most what the advance has left. Each use is a row in the PARC's
+  ``consumptions`` table (Purchase Advance Consumption). What the advance has left is its quantity
+  minus the quantity of its active rows.
+- The PARC stays a draft (open) while quantity is left. The receipt that uses the last of it (within
+  0.01) submits it (closed).
+- Cancelling a receipt makes its rows inactive, so their quantity is back on the advance. A closed
+  PARC is re-opened: Frappe cannot move a submitted document back to draft, so it is cancelled and
+  a fresh draft copy is inserted with every row (the cancelled receipt's now inactive).
+- Oldest advance first is enforced, on save and again on submit: a receipt may name only its
+  supplier's oldest advance in line with quantity left, and only one (``advances_a_receipt_may_name``).
+  An advance whose Purchase Order is Closed or On Hold is skipped, read from the order's status at
+  every check, and takes its place again once the order is re-opened (``skipped_in_queue``). The rest
+  of the receipt goes on rows without an advance.
+- Cancelling the Payment Entry deletes its draft PARCs, or is refused while a receipt uses one.
+
+``get_open_advances`` lists a supplier's open advances oldest first with what each has left, and
+``get_open_purchase_orders`` suggests purchase orders for the rest of a receipt, oldest first.
+``hooks.py`` ``doc_events`` wires the handlers onto Payment Entry and Purchase Receipt.
 """
-
-from collections import defaultdict
 
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import flt, fmt_money, format_datetime
-
-# A Purchase Receipt closes a draft PARC whose expected qty is within +/-20% of the received qty.
-MATCH_TOLERANCE = 0.20
-# Below this, expected vs received qty is treated as equal (float dust).
-QTY_EPSILON = 0.01
+from frappe.utils import flt
 
 PARC = "Purchase Advance Receipt Control"
+# Child table of PARC (field CONSUMPTIONS): one row per receipt that booked quantity against it.
+CONSUMPTION = "Purchase Advance Consumption"
+CONSUMPTIONS = "consumptions"
 EXPECTED = "qty_to_be_received_against_the_advance_paid"
+# Purchase Receipt Item field: the advance this row books against.
+PARC_FIELD = "custom_parc"
+# Quantities closer than this are treated as equal (float dust).
+QTY_EPSILON = 0.01
+# ERPNext refuses a Purchase Receipt against a Purchase Order in these states, so the oldest-first
+# queue skips an advance on such an order until the order is re-opened.
+PO_STATUSES_TAKING_NO_RECEIPT = ("Closed", "On Hold")
 
 
 class PurchaseAdvanceReceiptControl(Document):
-	pass
+	def validate(self):
+		# Stored for the form and the list view; every check recomputes both from the rows.
+		self.qty_consumed = consumed_qty(self)
+		self.qty_remaining = remaining_qty(self)
+
+
+class ParcRefusedError(frappe.ValidationError):
+	"""A Purchase Receipt names an advance it cannot use; the receipt is neither saved nor submitted."""
+
+
+def consumed_qty(parc):
+	"""Quantity the advance's active consumption rows book."""
+	return sum(flt(row.qty) for row in parc.get(CONSUMPTIONS) or [] if row.is_active)
+
+
+def remaining_qty(parc):
+	"""What the advance has left: its quantity minus its active consumption."""
+	return flt(parc.get(EXPECTED)) - consumed_qty(parc)
 
 
 def _received_qty(purchase_order):
@@ -39,32 +75,6 @@ def _received_qty(purchase_order):
 			"Purchase Receipt Item", {"purchase_order": purchase_order, "docstatus": 1}, "sum(qty)"
 		)
 	)
-
-
-def _draft_parcs(purchase_order):
-	return frappe.get_all(
-		PARC,
-		filters={"purchase_order": purchase_order, "docstatus": 0},
-		fields=["name", EXPECTED, "payment_entry", "advance_paid", "creation"],
-		order_by="creation asc",
-	)
-
-
-def _best_match(parcs, qty):
-	"""Draft PARC a receipt of `qty` would close: within tolerance, closest expected qty,
-	ties to the oldest advance. None when nothing is within range."""
-	tolerance = flt(qty) * MATCH_TOLERANCE
-	matching = [p for p in parcs if abs(flt(p[EXPECTED]) - qty) <= tolerance]
-	return min(matching, key=lambda p: (abs(flt(p[EXPECTED]) - qty), p["creation"])) if matching else None
-
-
-def _qty_by_po(doc):
-	"""Received qty per Purchase Order, summed across the receipt's item lines."""
-	out = defaultdict(float)
-	for item in doc.items:
-		if item.purchase_order:
-			out[item.purchase_order] += flt(item.qty)
-	return out
 
 
 # ---- Payment Entry: After Submit -> one draft PARC per Purchase Order reference ----------
@@ -101,110 +111,435 @@ def create_parc_on_payment_entry(doc, method=None):
 
 # ---- Payment Entry: On Cancel -> drop the draft PARCs this advance opened ------------------
 def delete_draft_parcs_on_payment_entry_cancel(doc, method=None):
+	"""Deletes the payment's draft PARCs, or refuses the cancel while a receipt uses one of them.
+
+	A PARC that receipts closed is not a draft: it links the payment, so Frappe's own check refuses
+	the cancel. A draft that receipts have used part of, or that a draft receipt names, is refused
+	here. Receipts that used it and were cancelled since do not count, so the delete is forced past
+	Frappe's link check, which would count them."""
 	for name in frappe.get_all(PARC, filters={"payment_entry": doc.name, "docstatus": 0}, pluck="name"):
-		frappe.delete_doc(PARC, name, ignore_permissions=True)
-
-
-# ---- Purchase Receipt: Before Validate -> warn when this receipt will not close a PARC exactly
-def warn_qty_mismatch_on_purchase_receipt(doc, method=None):
-	for po, qty in _qty_by_po(doc).items():
-		parcs = _draft_parcs(po)
-		if not parcs:
-			continue
-		best = _best_match(parcs, qty)
-		if best and abs(flt(best[EXPECTED]) - qty) <= QTY_EPSILON:
-			continue
-		frappe.msgprint(
-			msg=_render_mismatch_warning(po, qty, parcs, best, doc.currency),
-			title=_("Quantity Mismatch Warning"),
-			indicator="orange",
-		)
-
-
-def _render_mismatch_warning(po, qty, parcs, best, currency):
-	td = "border:1px solid #dee2e6;padding:8px;"
-	rows = "".join(
-		f"<tr><td style='{td}'><b>{p.name}</b></td>"
-		f"<td style='{td}'>{format_datetime(p.creation, 'dd-MM-yyyy hh:mm:ss a')}</td>"
-		f"<td style='{td}'>{p.payment_entry or 'N/A'}</td>"
-		f"<td style='{td}text-align:right;'>{fmt_money(p.advance_paid, currency=currency)}</td>"
-		f"<td style='{td}text-align:right;'>{flt(p[EXPECTED]):.2f}</td></tr>"
-		for p in parcs
-	)
-	if best:
-		verdict = (
-			f"<b style='color:#0066cc;'>Closest PARC: {best.name} (expected {flt(best[EXPECTED]):.2f})</b><br>"
-			f"<b style='color:#dc3545;'>Difference: {qty - flt(best[EXPECTED]):.2f}</b><br>"
-		)
-	else:
-		verdict = f"<b style='color:#dc3545;'>No draft PARC within &plusmn;{MATCH_TOLERANCE:.0%} of this quantity; none will be closed.</b><br>"
-	return f"""
-	<b>&#9888; Purchase Order: {po}</b><br><br>
-	<b>Purchase Receipt Quantity: {qty:.2f}</b><br><br>
-	<b>Related PARC Records (Draft Only):</b><br>
-	<table style='width:100%;border-collapse:collapse;margin-top:10px;'>
-	<tr style='background-color:#f8f9fa;'>
-	<th style='{td}text-align:left;'>PARC Number</th><th style='{td}text-align:left;'>Date &amp; Time</th>
-	<th style='{td}text-align:left;'>Payment Entry</th><th style='{td}text-align:right;'>Payment Amount</th>
-	<th style='{td}text-align:right;'>Expected Qty</th></tr>{rows}</table><br>
-	{verdict}<br>
-	<i>You can still submit this Purchase Receipt.</i>
-	"""
-
-
-# ---- Purchase Receipt: After Submit -> close the best-matching draft PARC ------------------
-def close_parc_on_purchase_receipt(doc, method=None):
-	for po, qty in _qty_by_po(doc).items():
-		parcs = _draft_parcs(po)
-		if not parcs:
-			continue
-		best = _best_match(parcs, qty)
-		if not best:
-			tolerance = qty * MATCH_TOLERANCE
-			frappe.msgprint(
-				_("No PARC found within &plusmn;20% range for PO: {0}<br>Receipt Qty: {1:.2f} (Range: {2:.2f} - {3:.2f})").format(
-					po, qty, qty - tolerance, qty + tolerance
-				),
-				alert=True,
-				indicator="orange",
+		parc = frappe.get_doc(PARC, name, for_update=True)
+		receipts = _receipts_using(parc)
+		if receipts:
+			frappe.throw(
+				_(
+					"Advance {0} is in use by Purchase Receipt {1}. Cancel those receipts, or clear the "
+					"advance on draft ones, before cancelling this payment."
+				).format(name, ", ".join(receipts)),
+				frappe.LinkExistsError,
 			)
-			continue
-		try:
-			parc = frappe.get_doc(PARC, best.name)
-			parc.purchase_receipt = doc.name
-			parc.qty_of_pr = qty
-			parc.grand_total_of_pr = doc.grand_total
-			# Received-to-date already includes this receipt (docstatus is 1 by on_submit).
-			parc.qty_left_to_be_received_from_po = flt(parc.qty_of_po) - _received_qty(po)
-			parc.flags.ignore_permissions = True
-			parc.submit()  # one save: no half-updated draft left behind if submit fails
+		frappe.delete_doc(PARC, name, ignore_permissions=True, force=True)
+
+
+def _receipts_using(parc):
+	"""Receipts that use the advance: its active consumption rows, and draft or submitted receipts
+	whose rows name it."""
+	active = {row.purchase_receipt for row in parc.get(CONSUMPTIONS) or [] if row.is_active}
+	naming = frappe.get_all(
+		"Purchase Receipt Item", filters={PARC_FIELD: parc.name, "docstatus": ["<", 2]}, pluck="parent"
+	)
+	return sorted(active | set(naming))
+
+
+# ---- Purchase Receipt: which advances a receipt may name -----------------------------------
+def skipped_in_queue(adv):
+	"""True while the advance's Purchase Order is Closed or On Hold: the oldest-first queue passes over
+	it, and it takes its place again, by its payment, once the order is re-opened. `adv` is a queue
+	entry (``_supplier_advances``), whose ``po_status`` is the order's status as this check reads it;
+	nothing about the skip is stored."""
+	return adv.get("po_status") in PO_STATUSES_TAKING_NO_RECEIPT
+
+
+def advances_a_receipt_may_name(open_advances):
+	"""The advances one receipt may name, out of `open_advances` (the supplier's advances in line with
+	quantity left, oldest first; skipped ones are not in it).
+
+	Working rule, kept in this one function so that it can be switched: the oldest advance, and only
+	that one. The rest of the receipt goes on rows without an advance and is mapped to purchase orders
+	by hand; it does not spill onto the next advance. Returning more advances here lets a receipt name
+	up to that many, one row each."""
+	return open_advances[:1]
+
+
+def advance_refusal(parc, row, receipt_supplier, advance_supplier):
+	"""Why receipt `row` cannot book against advance `parc`, or None when it can.
+
+	The advance is open and is an advance to the receipt's supplier; the row is on its Purchase Order,
+	in the unit it is counted in, and books some quantity but no more than the advance has left
+	(within 0.01). The rest of the receipt goes on rows without an advance."""
+	if parc.docstatus == 1:
+		if parc.purchase_receipt:
+			return _("is used up: Purchase Receipt {0} used the last of it").format(parc.purchase_receipt)
+		return _("is closed")
+	if parc.docstatus == 2:
+		return _("is cancelled")
+	if advance_supplier != receipt_supplier:
+		return _("is an advance to supplier {0}, not to {1}").format(advance_supplier, receipt_supplier)
+	if row.purchase_order != parc.purchase_order:
+		return _("is for Purchase Order {0}; this row is on {1}").format(
+			parc.purchase_order, row.purchase_order or _("no Purchase Order")
+		)
+	if row.uom != parc.uom_of_item:
+		return _("is counted in {0}; this row is in {1}").format(parc.uom_of_item, row.uom)
+	booked, left = flt(row.qty), remaining_qty(parc)
+	if booked <= 0:
+		return _("cannot be named on a row that books no quantity")
+	if booked - left > QTY_EPSILON:
+		reason = _(
+			"has {0:.3f} {1} left; this row books {2:.3f}. Book the rest on a row without an advance"
+		).format(left, parc.uom_of_item, booked)
+		last = _last_receipt(parc)
+		return reason + (_(" (last used by Purchase Receipt {0})").format(last) if last else "")
+	return None
+
+
+def _last_receipt(parc):
+	"""The receipt on the advance's latest active consumption row, if any."""
+	rows = [row for row in parc.get(CONSUMPTIONS) or [] if row.is_active]
+	return rows[-1].purchase_receipt if rows else None
+
+
+def _order_refusal(name, accepted, allowed, supplier, skipped=None):
+	"""Why the receipt may not name advance `name` under ``advances_a_receipt_may_name``, or None.
+
+	`accepted`: [(PARC, row)] this receipt already uses on earlier rows; `allowed`: what the rule
+	lets it name, oldest first; `skipped`: the advance's queue entry when the queue skips it."""
+	if name in [adv.name for adv in allowed]:
+		return None
+	if skipped:
+		return _(
+			"is skipped while its Purchase Order {0} is {1}; it takes its place in line again once the "
+			"order is re-opened"
+		).format(skipped.purchase_order, skipped.po_status)
+	if not allowed:
+		return _("is not an open advance of {0} for this receipt's company").format(supplier)
+	if len(accepted) >= len(allowed):
+		first, first_row = accepted[0]
+		return _(
+			"cannot be used as well: a receipt uses at most {0} advance(s), and row {1} names {2}. Book "
+			"this quantity on a row without an advance"
+		).format(len(allowed), first_row.idx, first.name)
+	oldest = allowed[len(accepted)]
+	return _(
+		"is not the oldest advance of {0} with quantity left: use {1} first ({2:.3f} {3} left on "
+		"Purchase Order {4}, paid {5})"
+	).format(
+		supplier,
+		oldest.name,
+		oldest.qty_remaining,
+		oldest.uom_of_item,
+		oldest.purchase_order,
+		oldest.payment_date,
+	)
+
+
+def _named_advances(doc, for_update=False):
+	"""[(PARC, row)] for the advance the receipt's rows name, or ParcRefusedError listing every row at
+	fault, one line each. A return cannot name an advance.
+
+	Each named advance must pass ``advance_refusal`` and ``advances_a_receipt_may_name``: today one
+	advance, named on one row, the supplier's oldest in line with quantity left within the receipt's
+	company. Advances the queue skips (``skipped_in_queue``) are left out of the line, so they neither
+	block a newer advance nor may be named.
+
+	With `for_update` (on submit) every PARC the decision reads is re-read under a row lock held until
+	the transaction ends: the supplier's open advances in line ahead of the named one, then the named
+	one, oldest first so that receipts racing for the same advances lock them in one order. A locking
+	read sees the latest committed rows, so an advance that another receipt has just used up, or used
+	part of, shows as such and this receipt is refused. What it cannot see: an advance re-opened
+	(re-inserted) or paid, or a Purchase Order closed, held or re-opened, by a transaction that commits
+	while this one runs. ERPNext's own posting runs before this and can still end in a deadlock or lock
+	wait timeout; nothing is saved then."""
+	rows = [row for row in doc.get("items") or [] if row.get(PARC_FIELD)]
+	if not rows:
+		return []
+	if doc.get("is_return"):
+		frappe.throw(
+			_("A return cannot use an advance (PARC); clear Advance (PARC) on its rows."), ParcRefusedError
+		)
+	queue = _supplier_advances(doc.supplier, doc.company)
+	line = [adv for adv in queue if not skipped_in_queue(adv)]
+	skipped = {adv.name: adv for adv in queue if skipped_in_queue(adv)}
+	parcs = _read_advances(list(dict.fromkeys(row.get(PARC_FIELD) for row in rows)), line, for_update)
+	allowed = advances_a_receipt_may_name(_with_quantity_left(line, parcs))
+	named, errors, seen = [], [], set()
+	for row in rows:
+		name = row.get(PARC_FIELD)
+		where = _("Row {0}: advance {1}").format(row.idx, name)
+		parc = parcs.get(name)
+		if name in seen:
+			errors.append((row.idx, _("{0} is named on more than one row").format(where)))
+		elif parc is None:
+			errors.append((row.idx, _("{0} does not exist").format(where)))
+		else:
+			supplier = parc.purchase_order and frappe.db.get_value(
+				"Purchase Order", parc.purchase_order, "supplier"
+			)
+			reason = advance_refusal(parc, row, doc.supplier, supplier) or _order_refusal(
+				name, named, allowed, doc.supplier, skipped.get(name)
+			)
+			if reason:
+				errors.append((row.idx, f"{where} {reason}"))
+			else:
+				named.append((parc, row))
+		seen.add(name)
+	if errors:
+		message = "<br>".join(text for _idx, text in sorted(errors))
+		frappe.throw(message, ParcRefusedError, title=_("Advance (PARC) refused"))
+	return named
+
+
+def _read_advances(names, line, for_update):
+	"""{name: PARC or None} for the named advances and, on submit, for the supplier's advances in line
+	ahead of them (`line`: the queue without the skipped ones). On submit every read is a locking read,
+	in one order: the advances in line oldest first up to the newest named one, then any named advance
+	not in line, by name."""
+	if for_update:
+		order = [adv.name for adv in line]
+		ahead = max((order.index(name) for name in names if name in order), default=-1)
+		names = order[: ahead + 1] + sorted(name for name in names if name not in order)
+	return {name: _read(name, for_update) for name in names}
+
+
+def _read(name, for_update=False):
+	"""The PARC, or None when it does not exist (any more)."""
+	if not frappe.db.exists(PARC, name):
+		return None
+	try:
+		return frappe.get_doc(PARC, name, for_update=for_update)
+	except frappe.DoesNotExistError:  # deleted by a transaction that committed after this one began
+		frappe.clear_last_message()
+		return None
+
+
+def _with_quantity_left(line, parcs):
+	"""The advances in line (oldest first) cut to those with quantity left, taking each advance's state
+	from `parcs` where it was read (under lock on submit), from the queue's snapshot otherwise."""
+	left = []
+	for adv in line:
+		if adv.name in parcs:
+			parc = parcs[adv.name]
+			if parc is None or parc.docstatus != 0:
+				continue
+			adv = frappe._dict(adv, qty_remaining=remaining_qty(parc))
+		if adv.qty_remaining > QTY_EPSILON:
+			left.append(adv)
+	return left
+
+
+def _supplier_advances(supplier, company=None):
+	"""The supplier's open (draft) advances, oldest first, each with qty_consumed, qty_remaining,
+	po_status and skipped (``skipped_in_queue``), as this transaction's snapshot shows them.
+
+	Oldest first: the Payment Entry's posting date, then the order the payments were entered
+	(creation), then PARC name. The name only orders the advances one payment opened (on several
+	Purchase Orders, or on several payment terms of one): it is creation order under the site's PARC
+	naming rule, a random hash without one."""
+	advances = _draft_advances(supplier, company)
+	used = _consumed_by([adv.name for adv in advances])
+	for adv in advances:
+		adv.qty_consumed = used.get(adv.name, 0.0)
+		adv.qty_remaining = flt(adv.get(EXPECTED)) - adv.qty_consumed
+		adv.skipped = skipped_in_queue(adv)
+	return sorted(advances, key=_oldest_first)
+
+
+def _oldest_first(adv):
+	return (adv.payment_date, adv.payment_created, adv.name)
+
+
+def _draft_advances(supplier, company=None):
+	"""The supplier's draft PARCs on submitted payments, with the payment's posting date and creation."""
+	parc = frappe.qb.DocType(PARC)
+	po = frappe.qb.DocType("Purchase Order")
+	pe = frappe.qb.DocType("Payment Entry")
+	query = (
+		frappe.qb.from_(parc)
+		.join(po)
+		.on(po.name == parc.purchase_order)
+		.join(pe)
+		.on(pe.name == parc.payment_entry)
+		.select(
+			parc.name,
+			parc.purchase_order,
+			parc.payment_entry,
+			pe.posting_date.as_("payment_date"),
+			pe.creation.as_("payment_created"),
+			parc.advance_paid,
+			parc[EXPECTED],
+			parc.uom_of_item,
+			po.company,
+			po.status.as_("po_status"),
+		)
+		.where((parc.docstatus == 0) & (pe.docstatus == 1) & (po.supplier == supplier))
+	)
+	if company:
+		query = query.where(po.company == company)
+	return query.run(as_dict=True)
+
+
+def _consumed_by(names):
+	"""{PARC name: quantity of its active consumption rows} for the named PARCs."""
+	used = {}
+	if names:
+		for row in frappe.get_all(
+			CONSUMPTION,
+			filters={"parenttype": PARC, "parent": ["in", names], "is_active": 1},
+			fields=["parent", "qty"],
+		):
+			used[row.parent] = used.get(row.parent, 0.0) + flt(row.qty)
+	return used
+
+
+# ---- Purchase Receipt: Validate -> refuse on save what the submit would refuse -------------
+def check_named_parcs_on_purchase_receipt(doc, method=None):
+	_named_advances(doc)
+
+
+# ---- Purchase Receipt: On Submit -> book the named advance, close it once used up ---------
+def consume_named_parcs_on_purchase_receipt(doc, method=None):
+	# Runs after ERPNext's own Purchase Receipt on_submit (Frappe calls the controller first, then
+	# doc_events). The checks are repeated on locked re-reads: of two receipts racing for what an
+	# advance has left, the later one is refused, even when both passed the save check.
+	for parc, row in _named_advances(doc, for_update=True):
+		parc.append(
+			CONSUMPTIONS,
+			{
+				"purchase_receipt": doc.name,
+				"purchase_receipt_item": row.name,
+				"posting_date": doc.posting_date,
+				"qty": flt(row.qty),
+				"is_active": 1,
+			},
+		)
+		parc.flags.ignore_permissions = True
+		left = remaining_qty(parc)
+		if left > QTY_EPSILON:
+			parc.save()
 			frappe.msgprint(
-				_("PARC {0} updated and submitted<br>PO: {1}<br>Expected Qty: {2:.2f}, Actual Qty: {3:.2f}").format(
-					best.name, po, flt(best[EXPECTED]), qty
+				_("Advance {0}: {1:.3f} {2} booked, {3:.3f} left").format(
+					parc.name, flt(row.qty), parc.uom_of_item, left
 				),
 				alert=True,
 				indicator="green",
 			)
-		except Exception as e:
-			# As before: a PARC that will not submit must not block the Purchase Receipt.
-			frappe.msgprint(_("Error submitting PARC: {0}").format(e), alert=True, indicator="red")
-			frappe.log_error(f"PARC Submit Error: {e}", "PARC Submission Failed")
-
-
-# ---- Purchase Receipt: On Cancel -> cancel the closed PARC and re-open the advance ---------
-def reopen_parc_on_purchase_receipt_cancel(doc, method=None):
-	# Runs before Frappe's back-link check, so cancelling the PARC here is what lets the
-	# Purchase Receipt cancel at all.
-	for name in frappe.get_all(PARC, filters={"purchase_receipt": doc.name, "docstatus": 1}, pluck="name"):
-		parc = frappe.get_doc(PARC, name)
-		parc.flags.ignore_permissions = True
-		parc.cancel()
-		draft = frappe.copy_doc(parc)
-		draft.docstatus = 0  # copy_doc keeps the source's (now cancelled) docstatus
-		draft.purchase_receipt = None
-		draft.qty_of_pr = None
-		draft.grand_total_of_pr = None
-		draft.qty_left_to_be_received_from_po = (
-			flt(parc.qty_of_po) - flt(parc.get(EXPECTED)) - _received_qty(parc.purchase_order)
+			continue
+		parc.purchase_receipt = doc.name
+		parc.qty_of_pr = consumed_qty(parc)
+		parc.grand_total_of_pr = doc.grand_total
+		# Received-to-date already includes this receipt (docstatus is 1 by on_submit).
+		parc.qty_left_to_be_received_from_po = flt(parc.qty_of_po) - _received_qty(parc.purchase_order)
+		parc.submit()
+		frappe.msgprint(
+			_("Advance {0} is used up; this receipt closed it").format(parc.name),
+			alert=True,
+			indicator="green",
 		)
-		draft.insert(ignore_permissions=True)
+
+
+# ---- Purchase Receipt: On Cancel -> the quantity goes back on the advances it used ---------
+def give_back_parcs_on_purchase_receipt_cancel(doc, method=None):
+	"""Makes the receipt's consumption rows inactive, so their quantity is back on the advance, and
+	re-opens an advance that was closed (``_reopen``). That includes an advance this receipt closed
+	whole before consumption rows existed (purchase_receipt set, no rows): it re-opens in full.
+
+	Runs before Frappe's back-link check, so cancelling the PARC that names this receipt in
+	purchase_receipt is what lets the receipt cancel at all."""
+	using = frappe.get_all(
+		CONSUMPTION,
+		filters={"parenttype": PARC, "purchase_receipt": doc.name, "is_active": 1, "docstatus": ["<", 2]},
+		pluck="parent",
+	)
+	closed = frappe.get_all(PARC, filters={"purchase_receipt": doc.name, "docstatus": 1}, pluck="name")
+	for name in sorted(set(using) | set(closed)):
+		parc = frappe.get_doc(PARC, name, for_update=True)
+		parc.flags.ignore_permissions = True
+		if parc.docstatus == 0:
+			_deactivate(parc, doc.name)
+			parc.save()
+		elif parc.docstatus == 1:
+			_reopen(parc, doc.name)
+
+
+def _deactivate(parc, receipt):
+	for row in parc.get(CONSUMPTIONS) or []:
+		if row.purchase_receipt == receipt:
+			row.is_active = 0
+
+
+def _reopen(parc, receipt):
+	"""Cancels closed PARC `parc` and inserts a fresh draft copy with `receipt`'s rows inactive, since
+	Frappe cannot move a submitted document back to draft. The copy keeps the payment and Purchase
+	Order, and so its place in the oldest-first order, except among the advances of one payment, which
+	go by name. The cancelled PARC keeps its rows as they were when it closed."""
+	# Other receipts that used the advance still name it; they must not block its cancel.
+	parc.ignore_linked_doctypes = ["Purchase Receipt"]
+	parc.cancel()
+	draft = frappe.copy_doc(parc)
+	draft.docstatus = 0  # under tests copy_doc keeps the source's (now cancelled) docstatus
+	draft.purchase_receipt = draft.qty_of_pr = draft.grand_total_of_pr = None
+	_deactivate(draft, receipt)
+	draft.qty_left_to_be_received_from_po = (
+		flt(parc.qty_of_po) - flt(parc.get(EXPECTED)) - _received_qty(parc.purchase_order)
+	)
+	draft.insert(ignore_permissions=True)
+	return draft
+
+
+# ---- Lookups for the receipt approval screen (read-only) -----------------------------------
+@frappe.whitelist(methods=["GET"])
+def get_open_advances(supplier: str, company: str | None = None):
+	"""A supplier's open advances with quantity left, oldest first (see ``_supplier_advances``): name,
+	purchase_order, payment_entry, payment_date, advance_paid, the advance's quantity, qty_consumed,
+	qty_remaining, uom_of_item, company, po_status, skipped. An advance whose Purchase Order is Closed
+	or On Hold is listed in its place with skipped true: the queue passes over it until the order is
+	re-opened. The first advance with skipped false is the only one the next receipt may name, for at
+	most its qty_remaining. Read-only."""
+	frappe.has_permission(PARC, "read", throw=True)
+	return [
+		frappe._dict({key: value for key, value in adv.items() if key != "payment_created"})
+		for adv in _supplier_advances(supplier, company)
+		if adv.qty_remaining > QTY_EPSILON
+	]
+
+
+@frappe.whitelist(methods=["GET"])
+def get_open_purchase_orders(supplier: str, company: str | None = None):
+	"""A suggestion for the part of a receipt beyond its advance: the supplier's purchase order lines
+	with quantity still to receive, oldest order first (order date, then the order they were entered,
+	then name and line). Leaves out orders that are closed or on hold, which ERPNext refuses a receipt
+	against. Nothing checks a receipt against this list; the approver chooses. Read-only."""
+	frappe.has_permission("Purchase Order", "read", throw=True)
+	po = frappe.qb.DocType("Purchase Order")
+	item = frappe.qb.DocType("Purchase Order Item")
+	to_receive = item.qty - item.received_qty
+	query = (
+		frappe.qb.from_(po)
+		.join(item)
+		.on((item.parent == po.name) & (item.parenttype == "Purchase Order"))
+		.select(
+			po.name.as_("purchase_order"),
+			po.transaction_date,
+			po.schedule_date,
+			po.company,
+			item.name.as_("purchase_order_item"),
+			item.item_code,
+			item.uom,
+			item.qty,
+			item.received_qty,
+			to_receive.as_("qty_to_receive"),
+		)
+		.where(
+			(po.docstatus == 1)
+			& (po.supplier == supplier)
+			& po.status.notin(["Closed", "On Hold"])
+			& (to_receive > QTY_EPSILON)
+		)
+		.orderby(po.transaction_date)
+		.orderby(po.creation)
+		.orderby(po.name)
+		.orderby(item.idx)
+	)
+	if company:
+		query = query.where(po.company == company)
+	return query.run(as_dict=True)
