@@ -33,6 +33,7 @@
   "qty_consumed",
   "column_break_qtyc",
   "qty_remaining",
+  "stuck_since",
   "consumptions"
  ],
  "fields": [
@@ -202,6 +203,16 @@
    "read_only": 1
   },
   {
+   "description": "Set by the daily check (IDEV-3334) while the advance is stuck: it has quantity left, but the line of its Purchase Order it books against has nothing left to receive, so no receipt can use it. Cleared once it is no longer stuck.",
+   "fieldname": "stuck_since",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Stuck Since",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
    "fieldname": "consumptions",
    "fieldtype": "Table",
    "label": "Receipts that used this advance",
@@ -213,7 +224,7 @@
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-09-30 12:00:00.000000",
+ "modified": "2026-10-08 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Fuelbuddy Procurement",
  "name": "Purchase Advance Receipt Control",
