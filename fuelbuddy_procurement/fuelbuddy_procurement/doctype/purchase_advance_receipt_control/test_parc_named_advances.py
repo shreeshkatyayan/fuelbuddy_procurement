@@ -1,7 +1,10 @@
 # Copyright (c) 2026, Fuelbuddy and contributors
 # For license information, please see license.txt
 
-"""Advances used up across receipts, through real documents, on a site with ERPNext and this app.
+"""Advances used up across receipts at the ERP desk, through real documents, on a site with ERPNext
+and this app. A receipt may name any open advances of its supplier, in any order, one row each
+(IDEV-3334 retired the oldest-first rule); receipt split holds are covered by
+receipt_split_hold/test_receipt_split_holds.py.
 
 Each test makes a supplier of its own (a copy of the site's latest submitted Purchase Order's
 supplier), so the site's real advances never queue ahead of the test's. It builds Purchase Orders by
@@ -276,29 +279,22 @@ class TestParcPartialAdvances(FrappeTestCase):
 		_submit(_receipt((po, 100.0, parc.name)))  # exactly what is left
 		self.assertEqual(_state(parc)[0], 1)
 
-	def test_oldest_advance_first_is_enforced(self):
+	def test_a_newer_advance_may_be_used_while_an_older_one_has_quantity_left(self):
 		po_new, po_old = self.po(), self.po()
 		(newer,) = _pay(po_new, 0.1, days_ago=1)  # 100 each
 		(older,) = _pay(po_old, 0.1, days_ago=3)
-		self.assertRefused(
-			_receipt((po_new, 50.0, newer.name)).insert,
-			f"advance {newer.name} is not the oldest advance of {self.supplier} with quantity left",
-			f"use {older.name} first (100.000",
-			f"on Purchase Order {po_old.name}",
-		)
-		_submit(_receipt((po_old, 60.0, older.name)))  # part of it: still first in line
-		self.assertRefused(_receipt((po_new, 50.0, newer.name)).insert, f"use {older.name} first (40.000")
-		_submit(_receipt((po_old, 40.0, older.name)))  # the rest: the older advance is used up
 		_submit(_receipt((po_new, 50.0, newer.name)))
-		self.assertEqual(_state(older)[0], 1)
 		self.assertAlmostEqual(_left(newer), 50.0, delta=0.01)
+		self.assertAlmostEqual(_left(older), 100.0, delta=0.01)
+		_submit(_receipt((po_old, 100.0, older.name)))
+		self.assertEqual(_state(older)[0], 1)
 
-	def test_payments_on_the_same_day_go_in_the_order_they_were_entered(self):
+	def test_payments_on_the_same_day_are_listed_in_the_order_they_were_entered(self):
 		po_1, po_2 = self.po(), self.po()
 		(first,) = _pay(po_1, 0.1, days_ago=2)
 		(second,) = _pay(po_2, 0.1, days_ago=2)
-		self.assertRefused(_receipt((po_2, 50.0, second.name)).insert, f"use {first.name} first")
-		_submit(_receipt((po_1, 50.0, first.name)))
+		self.assertEqual([row.name for row in get_open_advances(self.supplier)], [first.name, second.name])
+		_submit(_receipt((po_2, 50.0, second.name)))
 
 	def test_one_payment_on_two_payment_terms_opens_two_advances_used_one_after_the_other(self):
 		po = self.po(qty=1000.0, terms=_terms_template())
@@ -306,16 +302,12 @@ class TestParcPartialAdvances(FrappeTestCase):
 		self.assertEqual([round(_covered(parc), 3) for parc in advances], [500.0, 500.0])
 		first, second = advances  # one payment: by name
 		self.assertEqual([row.name for row in get_open_advances(self.supplier)], [first.name, second.name])
-		self.assertRefused(_receipt((po, 100.0, second.name)).insert, f"use {first.name} first (500.000")
 		_submit(_receipt((po, 300.0, first.name)))
 		self.assertRefused(_receipt((po, 300.0, first.name)).insert, "has 200.000")
-		self.assertRefused(
-			_receipt((po, 100.0, first.name), (po, 100.0, second.name)).insert,
-			f"advance {second.name} cannot be used as well",
-		)
-		last = _submit(_receipt((po, 200.0, first.name), (po, 100.0, None)))
-		self.assertEqual(_state(first), (1, last.name))
-		_submit(_receipt((po, 400.0, second.name)))
+		# One receipt may use both advances, one row each.
+		both = _submit(_receipt((po, 200.0, first.name), (po, 100.0, second.name), (po, 50.0, None)))
+		self.assertEqual(_state(first), (1, both.name))
+		_submit(_receipt((po, 300.0, second.name)))
 		self.assertAlmostEqual(_left(second), 100.0, delta=0.01)
 		self.assertEqual([row.name for row in get_open_advances(self.supplier)], [second.name])
 
@@ -461,25 +453,29 @@ class TestParcPartialAdvances(FrappeTestCase):
 		self.assertEqual(get_open_advances(self.supplier, company="PARC test: no such company"), [])
 		self.assertEqual(get_open_advances("PARC test: no such supplier"), [])
 
-	def test_an_advance_on_a_closed_or_held_order_is_skipped_until_the_order_is_reopened(self):
+	def test_an_advance_on_a_closed_or_held_order_cannot_be_used_until_the_order_is_reopened(self):
 		po_old, po_new = self.po(), self.po()
 		(older,) = _pay(po_old, 0.1, days_ago=2)  # 100 each
 		(newer,) = _pay(po_new, 0.1, days_ago=1)
 		# ERPNext's own status changes: Close and Re-open, Hold and Resume.
 		for status, reopened in (("Closed", "Submitted"), ("On Hold", "Draft")):
 			update_status(status, po_old.name)
-			_submit(_receipt((po_new, 10.0, newer.name)))  # the older advance is skipped
+			_submit(_receipt((po_new, 10.0, newer.name)))
 			rows = get_open_advances(self.supplier)
 			self.assertEqual(
 				[(row.name, row.po_status, row.skipped) for row in rows],
 				[(older.name, status, True), (newer.name, rows[1].po_status, False)],
 			)
-			update_status(reopened, po_old.name)  # back in its place, first in line
+			# A row on the order itself: ERPNext's own check refuses it before this app's.
+			self.assertRefused(
+				lambda: _receipt((po_old, 10.0, older.name)).insert(),
+				po_old.name,
+				status,
+				exc=frappe.ValidationError,
+			)
+			update_status(reopened, po_old.name)  # back in its place, usable again
 			self.assertEqual(
 				frappe.db.get_value("Purchase Order", po_old.name, "status"), "To Receive and Bill"
-			)
-			self.assertRefused(
-				_receipt((po_new, 10.0, newer.name)).insert, f"use {older.name} first (100.000"
 			)
 			rows = get_open_advances(self.supplier)
 			self.assertEqual(
