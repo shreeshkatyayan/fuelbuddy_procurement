@@ -1,0 +1,269 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "creation": "2026-10-08 12:00:00.000000",
+ "description": "Receipt split hold (IDEV-3334): the quantity an approved fuel receipt's split reserves on the supplier's advances (PARC) and purchase order lines until the receipt posts. Named {request_id}-v{version}. Written only by fuelbuddy_procurement.api.receipt_split_hold (place, release) and by the posting of the Purchase Receipt that names it; while Held, no other split and no desk receipt can take its quantity. Never deleted: a released, rejected or consumed version stays as the record of that attempt.",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "request_section",
+  "request_id",
+  "version",
+  "status",
+  "column_break_request",
+  "op_key",
+  "fifo",
+  "tombstone",
+  "live_request_id",
+  "lines_hash",
+  "receipt_section",
+  "supplier",
+  "company",
+  "column_break_receipt",
+  "item_code",
+  "total_litres",
+  "lines_section",
+  "lines",
+  "refusals",
+  "outcome_section",
+  "purchase_receipt",
+  "consumed_at",
+  "column_break_outcome",
+  "release_reason",
+  "released_at"
+ ],
+ "fields": [
+  {
+   "fieldname": "request_section",
+   "fieldtype": "Section Break",
+   "label": "Request"
+  },
+  {
+   "description": "The app's fuel request (fillup_request.id) whose receipt this split is for.",
+   "fieldname": "request_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Request ID",
+   "read_only": 1,
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "description": "The attempt, minted by the app: a higher version is newer. Placing a new version releases the request's live one.",
+   "fieldname": "version",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Version",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "description": "Held: reserves its lines' quantity. Rejected: the split did not fit (see Refusals); holds nothing. Released: given back (see Release Reason). Consumed: posted by the Purchase Receipt below.",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Held\nRejected\nReleased\nConsumed",
+   "read_only": 1,
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "column_break_request",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "The only Purchase Receipt (App Op Key) that may post this hold.",
+   "fieldname": "op_key",
+   "fieldtype": "Data",
+   "label": "Op Key",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "The split was the oldest-first pre-fill when it was placed: advances oldest first, each taking all it could, then purchase order lines oldest first.",
+   "fieldname": "fifo",
+   "fieldtype": "Check",
+   "label": "Oldest-first Split",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "Released before it was ever placed, so that a late place of this version, or of any lower one, holds nothing.",
+   "fieldname": "tombstone",
+   "fieldtype": "Check",
+   "label": "Tombstone",
+   "read_only": 1
+  },
+  {
+   "description": "Request ID while Held, empty otherwise. Unique: the database allows one live hold per request.",
+   "fieldname": "live_request_id",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Live Request ID",
+   "no_copy": 1,
+   "read_only": 1,
+   "unique": 1
+  },
+  {
+   "description": "A replay of this version must carry the same split.",
+   "fieldname": "lines_hash",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Lines Hash",
+   "read_only": 1
+  },
+  {
+   "fieldname": "receipt_section",
+   "fieldtype": "Section Break",
+   "label": "Receipt"
+  },
+  {
+   "fieldname": "supplier",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Supplier",
+   "options": "Supplier",
+   "read_only": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_receipt",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "label": "Item",
+   "options": "Item",
+   "read_only": 1
+  },
+  {
+   "description": "The receipt's litres: the lines add up to them.",
+   "fieldname": "total_litres",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Total Litres",
+   "precision": "3",
+   "read_only": 1
+  },
+  {
+   "fieldname": "lines_section",
+   "fieldtype": "Section Break",
+   "label": "Lines"
+  },
+  {
+   "fieldname": "lines",
+   "fieldtype": "Table",
+   "label": "Lines",
+   "options": "Receipt Split Hold Line",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.status == 'Rejected'",
+   "description": "Why the split did not fit: one entry per line at fault, plus the split's own.",
+   "fieldname": "refusals",
+   "fieldtype": "Code",
+   "label": "Refusals",
+   "options": "JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "outcome_section",
+   "fieldtype": "Section Break",
+   "label": "Outcome"
+  },
+  {
+   "fieldname": "purchase_receipt",
+   "fieldtype": "Link",
+   "label": "Purchase Receipt",
+   "options": "Purchase Receipt",
+   "read_only": 1
+  },
+  {
+   "fieldname": "consumed_at",
+   "fieldtype": "Datetime",
+   "label": "Consumed At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_outcome",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "REPLACED: a newer version was placed. POSTING_REFUSED: ERP refused its receipt. APP_WRITE_FAILED: the app could not record the approval. REQUEST_CLOSED: the request was rejected or cancelled. ORPHAN: the daily check found no approved request for it.",
+   "fieldname": "release_reason",
+   "fieldtype": "Select",
+   "label": "Release Reason",
+   "options": "\nREPLACED\nPOSTING_REFUSED\nAPP_WRITE_FAILED\nREQUEST_CLOSED\nORPHAN",
+   "read_only": 1
+  },
+  {
+   "fieldname": "released_at",
+   "fieldtype": "Datetime",
+   "label": "Released At",
+   "read_only": 1
+  }
+ ],
+ "grid_page_length": 50,
+ "in_create": 1,
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-10-08 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Fuelbuddy Procurement",
+ "name": "Receipt Split Hold",
+ "naming_rule": "By script",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Purchase Manager"
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Purchase User"
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock Manager"
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock User"
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "request_id",
+ "track_changes": 1
+}
